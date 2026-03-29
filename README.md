@@ -9,11 +9,11 @@ Trained model (.safetensors, .onnx, numpy)
         |
   Synthesizable Verilog (hardwired weights)
         |
-   OpenLane / LibreLane  (open source, exists today)
+   OpenLane / LibreLane  
         |
   GDS-II layout
         |
-   Tiny Tapeout / fab    ($100, exists today)
+   Tiny Tapeout / fab    
         |
   YOUR CHIP
 ```
