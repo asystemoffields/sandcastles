@@ -1,7 +1,6 @@
 # sandcastles
 
-**Compile neural network weights directly into synthesizable Verilog.
-No memory. No loading. The weights ARE the silicon.**
+**Compile neural network weights directly into synthesizable Verilog.**
 
 ```
 Trained model (.safetensors, .onnx, numpy)
@@ -23,7 +22,7 @@ Trained model (.safetensors, .onnx, numpy)
 
 sandcastles takes a trained neural network, quantizes the weights to fixed-point integers, and generates Verilog where **every weight is a numeric constant in the logic**. When a synthesis tool processes this Verilog, each `constant * input` multiplication becomes a fixed shift-add circuit. The weight values literally determine the transistor topology.
 
-This is the same core idea behind [Taalas](https://taalas.com/), which hard-wires Llama 3.1 8B into a physical chip achieving 17,000 tokens/sec. We're doing it at hobby scale, with open-source tools, for any model.
+This is the same core idea behind [Taalas](https://taalas.com/), which hard-wires Llama 3.1 8B into a physical chip achieving 17,000 tokens/sec.
 
 ## Supported operations
 
@@ -121,7 +120,7 @@ Every weight is a literal constant. No RAM, no ROM, no bus. The model IS the cir
         l0_sh_3[7:0];
 ```
 
-`32'sd85 * input` becomes a hardwired shift-add circuit — not a general multiplier. **The weight is the silicon.**
+`32'sd85 * input` becomes a hardwired shift-add circuit.
 
 ## Validated
 
@@ -158,30 +157,11 @@ w2s/
     onnx_import.py     — ONNX model import
 ```
 
-## Roadmap
-
-- [x] Dense, Conv2D, activation, normalization, attention, embedding, pooling
-- [x] GQA, SwiGLU, RoPE, KV cache (modern LLM support)
-- [x] int4/int8/int16 quantization with calibration
-- [x] ONNX import
-- [x] Sequential ROM+MAC mode with $readmemh for large models
-- [x] Serial I/O wrapper + Tiny Tapeout wrapper
-- [x] CLI tool
-- [x] Area estimator (99.3% accurate vs Yosys)
-- [x] Yosys synthesis validation (zero errors)
-- [x] GPT-2 compilation demo
-- [ ] FPGA demo (iCE40)
-- [ ] Tiny Tapeout submission
-- [ ] End-to-end DeepSeek-R1-Distill-1.5B compilation
-- [ ] PyTorch direct import
-
 ## Why this matters
 
 A hardwired inference chip: **one-time fabrication cost, zero ongoing cost, runs forever, no cloud, no data exfiltration, no subscription**. The model becomes a physical object you own.
 
-The fabrication tools are getting cheaper ([Tiny Tapeout](https://tinytapeout.com) = $100, [Atomic Semi](https://atomicsemi.com/) = affordable fabs, [Atum Works](https://www.ycombinator.com/companies/atum-works) = 3D-printed chips). The open-source design tools exist (OpenLane, Yosys, Magic). The only missing piece was a compiler that turns model weights into synthesizable Verilog targeting the free toolchain.
-
-This is that compiler.
+The fabrication tools are getting cheaper ([Tiny Tapeout](https://tinytapeout.com) = $100, [Atomic Semi](https://atomicsemi.com/) = affordable fabs, [Atum Works](https://www.ycombinator.com/companies/atum-works) = 3D-printed chips). The open-source design tools exist (OpenLane, Yosys, Magic). The only missing piece was a compiler that turns model weights into synthesizable Verilog targeting the free toolchain.  Now it's yours!
 
 ## License
 
