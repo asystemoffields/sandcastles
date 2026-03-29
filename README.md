@@ -157,11 +157,9 @@ w2s/
     onnx_import.py     — ONNX model import
 ```
 
-## Why this matters
+## Cheers to the future
 
-A hardwired inference chip: **one-time fabrication cost, zero ongoing cost, runs forever, no cloud, no data exfiltration, no subscription**. The model becomes a physical object you own.
-
-The fabrication tools are getting cheaper ([Tiny Tapeout](https://tinytapeout.com) = $100, [Atomic Semi](https://atomicsemi.com/) = affordable fabs, [Atum Works](https://www.ycombinator.com/companies/atum-works) = 3D-printed chips). The open-source design tools exist (OpenLane, Yosys, Magic). The only missing piece was a compiler that turns model weights into synthesizable Verilog targeting the free toolchain.  Now it's yours!
+It feels like the window to democratize the near-term benefits of artificial intelligence as it currently exists is closing.  I want to contribute as much as possible to a future where people can still own and make things, and not rely on a supplier for perfomant LLMs.
 
 ## License
 
