@@ -22,7 +22,7 @@ Trained model (.onnx, HuggingFace, numpy)
 
 sandcastles takes a trained neural network, quantizes the weights to fixed-point integers, and generates Verilog where **every weight is a numeric constant in the logic**. When a synthesis tool processes this Verilog, each `constant * input` multiplication becomes a fixed shift-add circuit. The weight values literally determine the transistor topology.
 
-This is the same core idea behind [Taalas](https://taalas.com/), which hard-wires Llama 3.1 8B into a physical chip achieving 17,000 tokens/sec.
+This is the core idea behind [Taalas](https://taalas.com/), which hard-wires Llama 3.1 8B into a physical chip achieving 17,000 tokens/sec.
 
 ## Supported operations
 
@@ -95,8 +95,6 @@ Compile any supported HuggingFace model by ID — no ONNX export needed:
 python -m w2s compile hf://openai-community/gpt2 --mode sequential --bits 8
 python -m w2s info hf://TinyLlama/TinyLlama-1.1B-Chat-v1.0
 ```
-
-Supported architectures: GPT, Llama, Mistral, Qwen, Phi, Gemma.
 
 ### Auto-fit
 
@@ -313,7 +311,7 @@ w2s/
   importers/
     builder.py         — Fluent GraphBuilder API
     onnx_import.py     — ONNX model import
-    hf_import.py       — HuggingFace model import (GPT-2, Llama, Mistral, etc.)
+    hf_import.py       — HuggingFace model import
 ```
 
 ## Cheers to the future
