@@ -53,7 +53,8 @@ class TestMixedPrecision:
         assert path.endswith(".v")
         with open(path) as f:
             content = f.read()
-        assert "mixed" in content or "module" in content
+        # compile_graph writes "mixed [int4/int16]" in the Verilog header
+        assert "mixed" in content
 
     def test_no_bits_map_is_default(self):
         """Without bits_map, all ops use the default bit width."""

@@ -16,8 +16,6 @@ from w2s import __version__
 
 BANNER = "weights2silicon (w2s) — Compile neural networks to hardwired Verilog"
 
-SUPPORTED_FORMATS = [".onnx", ".safetensors"]
-
 
 # ---------------------------------------------------------------------------
 #  Model loading
@@ -26,47 +24,68 @@ SUPPORTED_FORMATS = [".onnx", ".safetensors"]
 def _load_model(model_path: str, name: str = None):
     """Load a model file and return a ComputeGraph.
 
-    Supports .onnx files.  .safetensors is recognized but not yet fully
-    supported.
+    Supports:
+      - .onnx files (requires onnx package)
+      - hf:// URIs for HuggingFace models (requires huggingface_hub + safetensors)
+      - HuggingFace model IDs containing '/' (e.g., "openai-community/gpt2")
     """
-    path = Path(model_path)
-
-    if not path.exists():
-        print(f"Error: file not found: {model_path}", file=sys.stderr)
-        sys.exit(1)
-
-    ext = path.suffix.lower()
-
-    if ext == ".onnx":
+    if model_path.startswith("hf://"):
+        # Explicit HF prefix — always use HF
+        model_id = model_path.removeprefix("hf://")
         try:
-            from w2s.importers.onnx_import import load_onnx
+            from w2s.importers.hf_import import load_hf
         except ImportError:
             print(
-                "Error: the 'onnx' package is required to load .onnx models.\n"
-                "Install it with:  pip install onnx",
+                "Error: HuggingFace loading requires huggingface_hub and safetensors.\n"
+                "Install them with:  pip install huggingface_hub safetensors",
                 file=sys.stderr,
             )
             sys.exit(1)
-        return load_onnx(str(path), name=name)
+        return load_hf(model_id, name=name)
 
-    elif ext == ".safetensors":
-        print(
-            "Error: .safetensors loading requires architecture detection which is\n"
-            "not yet fully supported.  For now, please convert your model to ONNX\n"
-            "format first.  You can use torch.onnx.export() or optimum-cli:\n"
-            "\n"
-            "    optimum-cli export onnx --model <hf_model_id> output_dir/\n",
-            file=sys.stderr,
-        )
-        sys.exit(1)
+    elif "/" in model_path and not Path(model_path).suffix and not Path(model_path).exists():
+        # Looks like a HF model ID and doesn't exist as a local file
+        model_id = model_path
+        try:
+            from w2s.importers.hf_import import load_hf
+        except ImportError:
+            print(
+                "Error: HuggingFace loading requires huggingface_hub and safetensors.\n"
+                "Install them with:  pip install huggingface_hub safetensors",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        return load_hf(model_id, name=name)
 
     else:
-        print(
-            f"Error: unsupported model format '{ext}'.\n"
-            f"Supported formats: {', '.join(SUPPORTED_FORMATS)}",
-            file=sys.stderr,
-        )
-        sys.exit(1)
+        # Treat as local file path
+        path = Path(model_path)
+
+        if not path.exists():
+            print(f"Error: file not found: {model_path}", file=sys.stderr)
+            sys.exit(1)
+
+        ext = path.suffix.lower()
+
+        if ext == ".onnx":
+            try:
+                from w2s.importers.onnx_import import load_onnx
+            except ImportError:
+                print(
+                    "Error: the 'onnx' package is required to load .onnx models.\n"
+                    "Install it with:  pip install onnx",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+            return load_onnx(str(path), name=name)
+
+        else:
+            print(
+                f"Error: unsupported model format '{ext}'.\n"
+                f"Supported: .onnx, or HuggingFace model ID (hf://model-id)",
+                file=sys.stderr,
+            )
+            sys.exit(1)
 
 
 # ---------------------------------------------------------------------------
@@ -428,6 +447,128 @@ def cmd_info(args):
 
 
 # ---------------------------------------------------------------------------
+#  Command: autofit
+# ---------------------------------------------------------------------------
+
+def cmd_autofit(args):
+    print(BANNER)
+    print()
+    print(f"  Model  : {args.model}")
+    print(f"  Device : {args.device}")
+    print()
+
+    model_name = args.name or Path(args.model).stem
+    print("Loading model...")
+    graph = _load_model(args.model, name=model_name)
+    total_params = _count_params(graph)
+    print(f"  {len(graph.operations)} operations, {total_params:,} parameters")
+    print()
+
+    # Generate calibration data
+    calib_data = {}
+    for inp_name in graph.input_names:
+        shape = graph.input_shapes.get(inp_name, (1,))
+        calib_shape = (4,) + tuple(shape)
+        calib_data[inp_name] = np.random.randn(*calib_shape).astype(np.float32)
+
+    # Run auto-fit
+    from w2s.fpga import DEVICES
+    from w2s.autofit import autofit_fpga, analyze_sensitivity
+
+    device = DEVICES.get(args.device)
+    if device is None:
+        print(f"Error: unknown device '{args.device}'", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"Running sensitivity analysis...")
+    sensitivity = analyze_sensitivity(graph, calib_data)
+    print(sensitivity)
+    print()
+
+    print(f"Searching for best configuration to fit {device.name} "
+          f"({device.lut4s:,} LUT4s)...")
+    result = autofit_fpga(
+        graph, calib_data, device,
+        max_sparsity=getattr(args, 'max_sparsity', 0.75),
+    )
+    print()
+    print(result)
+    print()
+
+    if result.fits and result.bits_map:
+        print("  To compile with this configuration:")
+        bm = ",".join(f"{k}={v}" for k, v in result.bits_map.items() if v != result.bits)
+        print(f"    python -m w2s compile {args.model} --bits {result.bits} "
+              f"--mode {result.mode} --bits-map \"{bm}\"")
+        print()
+
+
+# ---------------------------------------------------------------------------
+#  Command: build
+# ---------------------------------------------------------------------------
+
+def cmd_build(args):
+    print(BANNER)
+    print()
+
+    model_name = args.name or Path(args.model).stem
+    print(f"  Model  : {args.model}")
+    print(f"  Device : {args.device}")
+    print(f"  Output : {args.output}")
+    print()
+
+    # Detect tools
+    from w2s.pipeline import detect_tools, build
+    tools = detect_tools()
+    print("  Tools detected:")
+    for name, status in tools.items():
+        if status.available:
+            print(f"    {name:<20} {status.version}")
+    missing = [t.name for t in tools.values() if not t.available]
+    if missing:
+        print(f"    Missing: {', '.join(missing)}")
+    print()
+
+    # Load model
+    print("Loading model...")
+    graph = _load_model(args.model, name=model_name)
+    total_params = _count_params(graph)
+    print(f"  {len(graph.operations)} operations, {total_params:,} parameters")
+    print()
+
+    # Generate calibration data
+    calib_data = {}
+    for inp_name in graph.input_names:
+        shape = graph.input_shapes.get(inp_name, (1,))
+        calib_shape = (4,) + tuple(shape)
+        calib_data[inp_name] = np.random.randn(*calib_shape).astype(np.float32)
+
+    # Select mode
+    mode = args.mode
+    if mode == "auto":
+        mode = "sequential" if total_params > 50000 else "combinational"
+        print(f"  Auto-selected mode: {mode}")
+
+    bits_map = _parse_bits_map(getattr(args, 'bits_map', None))
+
+    # Run pipeline
+    result = build(
+        graph, calib_data,
+        output_dir=args.output,
+        mode=mode,
+        bits=args.bits,
+        bits_map=bits_map,
+        target=args.device,
+        simulate=not args.no_simulate,
+        synthesize=not args.no_synthesize,
+        route=not args.no_synthesize,
+        bitstream=not args.no_synthesize,
+    )
+
+    print(result)
+
+
+# ---------------------------------------------------------------------------
 #  Argument parser
 # ---------------------------------------------------------------------------
 
@@ -584,6 +725,89 @@ def build_parser():
         help="Generate testbench for which mode (default: combinational)",
     )
 
+    # --- autofit ---
+    p_autofit = subparsers.add_parser(
+        "autofit",
+        help="Automatically find the best quantization to fit a target device",
+    )
+    p_autofit.add_argument(
+        "model",
+        help="Path to model file, ONNX, or HuggingFace model ID (hf://model-id)",
+    )
+    p_autofit.add_argument(
+        "--device",
+        choices=["ice40up5k", "ice40hx8k", "ecp5-25k", "ecp5-85k"],
+        default="ice40up5k",
+        help="Target FPGA device (default: ice40up5k)",
+    )
+    p_autofit.add_argument(
+        "--name", "-n",
+        default=None,
+        help="Verilog module name (default: derived from filename)",
+    )
+    p_autofit.add_argument(
+        "--max-sparsity",
+        type=float,
+        default=0.75,
+        help="Maximum sparsity level to try (default: 0.75)",
+    )
+
+    # --- build ---
+    p_build = subparsers.add_parser(
+        "build",
+        help="End-to-end pipeline: quantize → compile → simulate → synthesize → bitstream",
+    )
+    p_build.add_argument(
+        "model",
+        help="Path to model file, ONNX, or HuggingFace model ID (hf://model-id)",
+    )
+    p_build.add_argument(
+        "--output", "-o",
+        default="./build",
+        help="Output directory (default: ./build)",
+    )
+    p_build.add_argument(
+        "--mode", "-m",
+        choices=["combinational", "sequential", "auto"],
+        default="auto",
+        help="Compilation mode (default: auto)",
+    )
+    p_build.add_argument(
+        "--bits", "-b",
+        type=int,
+        choices=[4, 8, 16],
+        default=8,
+        help="Quantization bit width (default: 8)",
+    )
+    p_build.add_argument(
+        "--name", "-n",
+        default=None,
+        help="Verilog module name (default: derived from filename)",
+    )
+    p_build.add_argument(
+        "--device",
+        choices=["ice40up5k", "ice40hx8k", "ecp5-25k", "ecp5-85k"],
+        default="ice40up5k",
+        help="Target FPGA device (default: ice40up5k)",
+    )
+    p_build.add_argument(
+        "--bits-map",
+        default=None,
+        help="Mixed-precision per-layer bit widths (e.g., 'hidden=4,output=16')",
+    )
+    p_build.add_argument(
+        "--no-simulate",
+        action="store_true",
+        default=False,
+        help="Skip simulation stage",
+    )
+    p_build.add_argument(
+        "--no-synthesize",
+        action="store_true",
+        default=False,
+        help="Skip synthesis and later stages",
+    )
+
     # --- info ---
     p_info = subparsers.add_parser(
         "info",
@@ -616,6 +840,10 @@ def main():
             cmd_estimate(args)
         elif args.command == "testbench":
             cmd_testbench(args)
+        elif args.command == "autofit":
+            cmd_autofit(args)
+        elif args.command == "build":
+            cmd_build(args)
         elif args.command == "info":
             cmd_info(args)
     except KeyboardInterrupt:

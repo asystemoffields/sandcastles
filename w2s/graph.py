@@ -333,9 +333,12 @@ def generate_testbench(
                         exp_wire = f"exp_{wn}_v{t}"
                         diff_wire = f"diff_{wn}_v{t}"
                         lines.append(f"        // Tolerance check for {wn}")
-                        lines.append(f"        begin")
-                        lines.append(f"            wire signed [{bits-1}:0] {exp_wire} = {emit.slit(bits, exp_val)};")
-                        lines.append(f"            wire signed [{bits}:0] {diff_wire} = "
+                        blk_name = f"tol_blk_v{t}_{wn}"
+                        lines.append(f"        begin : {blk_name}")
+                        lines.append(f"            reg signed [{bits-1}:0] {exp_wire};")
+                        lines.append(f"            reg signed [{bits}:0] {diff_wire};")
+                        lines.append(f"            {exp_wire} = {emit.slit(bits, exp_val)};")
+                        lines.append(f"            {diff_wire} = "
                                      f"{{{{1{{{wn}[{bits-1}]}}}}, {wn}}} - "
                                      f"{{{{1{{{exp_wire}[{bits-1}]}}}}, {exp_wire}}};")
                         lines.append(f"            if ({diff_wire} > {tolerance} || {diff_wire} < -{tolerance}) begin")
@@ -524,9 +527,12 @@ def generate_sequential_testbench(
                             exp_wire = f"exp_seq_{t}_{flat_idx}"
                             diff_wire = f"diff_seq_{t}_{flat_idx}"
                             lines.append(f"        // Tolerance check for captured_outputs[{global_idx}]")
-                            lines.append(f"        begin")
-                            lines.append(f"            wire signed [{bits-1}:0] {exp_wire} = {emit.slit(bits, exp_val)};")
-                            lines.append(f"            wire signed [{bits}:0] {diff_wire} = "
+                            blk_name = f"tol_blk_seq_v{t}_{flat_idx}"
+                            lines.append(f"        begin : {blk_name}")
+                            lines.append(f"            reg signed [{bits-1}:0] {exp_wire};")
+                            lines.append(f"            reg signed [{bits}:0] {diff_wire};")
+                            lines.append(f"            {exp_wire} = {emit.slit(bits, exp_val)};")
+                            lines.append(f"            {diff_wire} = "
                                          f"{{{{1{{captured_outputs[{global_idx}][{bits-1}]}}}}, captured_outputs[{global_idx}]}} - "
                                          f"{{{{1{{{exp_wire}[{bits-1}]}}}}, {exp_wire}}};")
                             lines.append(f"            if ({diff_wire} > {tolerance} || {diff_wire} < -{tolerance}) begin")
@@ -873,6 +879,149 @@ def _forward_op_int(
         idx = _get(op.inputs[0])
         table = op.q_weights['weight'].astype(np.int64)
         tensors[op.outputs[0]] = table[idx.astype(int)]
+
+    elif op.op_type == OpType.MULTI_HEAD_ATTENTION:
+        x = _get(op.inputs[0])
+        # Q projection
+        wq = op.q_weights['q_weight'].astype(np.int64)
+        bq = op.q_weights.get('q_bias', np.zeros(wq.shape[0])).astype(np.int64)
+        q_acc = x @ wq.T + bq
+        q_mult = op.q_params.get('q_requant_mult', 1)
+        q_shift = op.q_params.get('q_requant_shift', 0)
+        if isinstance(q_mult, np.ndarray):
+            q_val = (q_acc * q_mult.astype(np.int64)) >> q_shift
+        else:
+            q_val = (q_acc * int(q_mult)) >> q_shift
+        q_val = np.clip(q_val, -qmax, qmax)
+        # K projection
+        wk = op.q_weights['k_weight'].astype(np.int64)
+        bk = op.q_weights.get('k_bias', np.zeros(wk.shape[0])).astype(np.int64)
+        k_acc = x @ wk.T + bk
+        k_mult = op.q_params.get('k_requant_mult', 1)
+        k_shift = op.q_params.get('k_requant_shift', 0)
+        if isinstance(k_mult, np.ndarray):
+            k_val = (k_acc * k_mult.astype(np.int64)) >> k_shift
+        else:
+            k_val = (k_acc * int(k_mult)) >> k_shift
+        k_val = np.clip(k_val, -qmax, qmax)
+        # V projection
+        wv = op.q_weights['v_weight'].astype(np.int64)
+        bv = op.q_weights.get('v_bias', np.zeros(wv.shape[0])).astype(np.int64)
+        v_acc = x @ wv.T + bv
+        v_mult = op.q_params.get('v_requant_mult', 1)
+        v_shift = op.q_params.get('v_requant_shift', 0)
+        if isinstance(v_mult, np.ndarray):
+            v_val = (v_acc * v_mult.astype(np.int64)) >> v_shift
+        else:
+            v_val = (v_acc * int(v_mult)) >> v_shift
+        v_val = np.clip(v_val, -qmax, qmax)
+        # For single token (seq_len=1): attention output = V
+        # (softmax/ReLU-attention of a single element is always weight 1.0)
+        # Output projection
+        wo = op.q_weights['out_weight'].astype(np.int64)
+        bo = op.q_weights.get('out_bias', np.zeros(wo.shape[0])).astype(np.int64)
+        out_acc = v_val @ wo.T + bo
+        out_mult = op.q_params.get('out_requant_mult', 1)
+        out_shift = op.q_params.get('out_requant_shift', 0)
+        if isinstance(out_mult, np.ndarray):
+            out_val = (out_acc * out_mult.astype(np.int64)) >> out_shift
+        else:
+            out_val = (out_acc * int(out_mult)) >> out_shift
+        tensors[op.outputs[0]] = np.clip(out_val, -qmax, qmax).astype(np.int64)
+
+    elif op.op_type == OpType.GROUPED_QUERY_ATTENTION:
+        # For single token, GQA is identical to MHA (no KV head sharing effect)
+        x = _get(op.inputs[0])
+        # Q projection
+        wq = op.q_weights['q_weight'].astype(np.int64)
+        bq = op.q_weights.get('q_bias', np.zeros(wq.shape[0])).astype(np.int64)
+        q_acc = x @ wq.T + bq
+        q_mult = op.q_params.get('q_requant_mult', 1)
+        q_shift = op.q_params.get('q_requant_shift', 0)
+        if isinstance(q_mult, np.ndarray):
+            q_val = (q_acc * q_mult.astype(np.int64)) >> q_shift
+        else:
+            q_val = (q_acc * int(q_mult)) >> q_shift
+        q_val = np.clip(q_val, -qmax, qmax)
+        # K projection
+        wk = op.q_weights['k_weight'].astype(np.int64)
+        bk = op.q_weights.get('k_bias', np.zeros(wk.shape[0])).astype(np.int64)
+        k_acc = x @ wk.T + bk
+        k_mult = op.q_params.get('k_requant_mult', 1)
+        k_shift = op.q_params.get('k_requant_shift', 0)
+        if isinstance(k_mult, np.ndarray):
+            k_val = (k_acc * k_mult.astype(np.int64)) >> k_shift
+        else:
+            k_val = (k_acc * int(k_mult)) >> k_shift
+        k_val = np.clip(k_val, -qmax, qmax)
+        # V projection
+        wv = op.q_weights['v_weight'].astype(np.int64)
+        bv = op.q_weights.get('v_bias', np.zeros(wv.shape[0])).astype(np.int64)
+        v_acc = x @ wv.T + bv
+        v_mult = op.q_params.get('v_requant_mult', 1)
+        v_shift = op.q_params.get('v_requant_shift', 0)
+        if isinstance(v_mult, np.ndarray):
+            v_val = (v_acc * v_mult.astype(np.int64)) >> v_shift
+        else:
+            v_val = (v_acc * int(v_mult)) >> v_shift
+        v_val = np.clip(v_val, -qmax, qmax)
+        # For single token (seq_len=1): attention output = V
+        # Output projection
+        wo = op.q_weights['out_weight'].astype(np.int64)
+        bo = op.q_weights.get('out_bias', np.zeros(wo.shape[0])).astype(np.int64)
+        out_acc = v_val @ wo.T + bo
+        out_mult = op.q_params.get('out_requant_mult', 1)
+        out_shift = op.q_params.get('out_requant_shift', 0)
+        if isinstance(out_mult, np.ndarray):
+            out_val = (out_acc * out_mult.astype(np.int64)) >> out_shift
+        else:
+            out_val = (out_acc * int(out_mult)) >> out_shift
+        tensors[op.outputs[0]] = np.clip(out_val, -qmax, qmax).astype(np.int64)
+
+    elif op.op_type == OpType.SWIGLU:
+        x = _get(op.inputs[0])
+        # Gate projection
+        wg = op.q_weights['gate_weight'].astype(np.int64)
+        bg = op.q_weights.get('gate_bias', np.zeros(wg.shape[0])).astype(np.int64)
+        gate_acc = x @ wg.T + bg
+        gate_mult = op.q_params.get('gate_requant_mult', 1)
+        gate_shift = op.q_params.get('gate_requant_shift', 0)
+        if isinstance(gate_mult, np.ndarray):
+            gate = (gate_acc * gate_mult.astype(np.int64)) >> gate_shift
+        else:
+            gate = (gate_acc * int(gate_mult)) >> gate_shift
+        gate = np.clip(gate, -qmax, qmax)
+        # Up projection
+        wu = op.q_weights['up_weight'].astype(np.int64)
+        bu = op.q_weights.get('up_bias', np.zeros(wu.shape[0])).astype(np.int64)
+        up_acc = x @ wu.T + bu
+        up_mult = op.q_params.get('up_requant_mult', 1)
+        up_shift = op.q_params.get('up_requant_shift', 0)
+        if isinstance(up_mult, np.ndarray):
+            up = (up_acc * up_mult.astype(np.int64)) >> up_shift
+        else:
+            up = (up_acc * int(up_mult)) >> up_shift
+        up = np.clip(up, -qmax, qmax)
+        # SiLU on gate: silu(x) = x * sigmoid(x)
+        # Convert to float, apply silu, convert back
+        gate_float = gate.astype(np.float64) / qmax
+        sig = 1.0 / (1.0 + np.exp(-gate_float))
+        silu_float = gate_float * sig
+        gate_silu = np.clip(np.round(silu_float * qmax), -qmax, qmax).astype(np.int64)
+        # Element-wise multiply gate_silu * up, then shift to stay in range
+        hidden = (gate_silu * up) >> (bits - 1)
+        hidden = np.clip(hidden, -qmax, qmax)
+        # Down projection
+        wd = op.q_weights['down_weight'].astype(np.int64)
+        bd = op.q_weights.get('down_bias', np.zeros(wd.shape[0])).astype(np.int64)
+        down_acc = hidden @ wd.T + bd
+        down_mult = op.q_params.get('down_requant_mult', 1)
+        down_shift = op.q_params.get('down_requant_shift', 0)
+        if isinstance(down_mult, np.ndarray):
+            down = (down_acc * down_mult.astype(np.int64)) >> down_shift
+        else:
+            down = (down_acc * int(down_mult)) >> down_shift
+        tensors[op.outputs[0]] = np.clip(down, -qmax, qmax).astype(np.int64)
 
     else:
         # Passthrough for unhandled ops

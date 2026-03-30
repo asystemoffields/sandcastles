@@ -84,3 +84,82 @@ class TestCLIParser:
         assert args.mode == "combinational"
         assert args.bits == 16
         assert args.name == "net"
+
+    def test_compile_with_fpga_target(self):
+        parser = build_parser()
+        args = parser.parse_args([
+            "compile", "model.onnx",
+            "--target", "fpga",
+            "--device", "ecp5-25k",
+        ])
+        assert args.command == "compile"
+        assert args.target == "fpga"
+        assert args.device == "ecp5-25k"
+
+    def test_compile_with_bits_map(self):
+        parser = build_parser()
+        args = parser.parse_args([
+            "compile", "model.onnx",
+            "--bits-map", "hidden=4,output=16",
+        ])
+        assert args.command == "compile"
+        assert args.bits_map == "hidden=4,output=16"
+
+    # --- autofit ---
+
+    def test_autofit_command_accepted(self):
+        parser = build_parser()
+        args = parser.parse_args(["autofit", "model.onnx"])
+        assert args.command == "autofit"
+        assert args.model == "model.onnx"
+
+    def test_autofit_with_device(self):
+        parser = build_parser()
+        args = parser.parse_args([
+            "autofit", "model.onnx",
+            "--device", "ecp5-25k",
+        ])
+        assert args.command == "autofit"
+        assert args.device == "ecp5-25k"
+
+    # --- build ---
+
+    def test_build_command_accepted(self):
+        parser = build_parser()
+        args = parser.parse_args(["build", "model.onnx"])
+        assert args.command == "build"
+        assert args.model == "model.onnx"
+
+    def test_build_with_options(self):
+        parser = build_parser()
+        args = parser.parse_args([
+            "build", "model.onnx",
+            "--device", "ice40up5k",
+            "--no-simulate",
+            "--bits", "4",
+        ])
+        assert args.command == "build"
+        assert args.device == "ice40up5k"
+        assert args.no_simulate is True
+        assert args.bits == 4
+
+    # --- testbench ---
+
+    def test_testbench_command_accepted(self):
+        parser = build_parser()
+        args = parser.parse_args(["testbench", "model.onnx"])
+        assert args.command == "testbench"
+        assert args.model == "model.onnx"
+
+    def test_testbench_with_options(self):
+        parser = build_parser()
+        args = parser.parse_args([
+            "testbench", "model.onnx",
+            "--vectors", "8",
+            "--vcd",
+            "--tolerance", "2",
+        ])
+        assert args.command == "testbench"
+        assert args.vectors == 8
+        assert args.vcd is True
+        assert args.tolerance == 2

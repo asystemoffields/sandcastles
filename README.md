@@ -3,17 +3,17 @@
 **Compile neural network weights directly into synthesizable Verilog.**
 
 ```
-Trained model (.onnx, numpy)
+Trained model (.onnx, HuggingFace, numpy)
         |
-  [ sandcastles ]        
+  [ sandcastles ]
         |
   Synthesizable Verilog (the hardwired weights)
         |
-   OpenLane / LibreLane  
+   Yosys + nextpnr (FPGA) / OpenLane (ASIC)
         |
-  GDS-II layout
+  Bitstream or GDS-II layout
         |
-   Tiny Tapeout / fab    
+   iCE40 / ECP5 / Tiny Tapeout / fab
         |
   YOUR CHIP
 ```
@@ -42,7 +42,7 @@ Architecturally supports the building blocks used in modern LLMs (DeepSeek, Llam
 
 **Quantization**: int4, int8, int16. Symmetric or asymmetric. Per-tensor or per-channel. Mixed-precision per layer.
 
-**Import**: ONNX models, numpy arrays, or the fluent GraphBuilder API.
+**Import**: HuggingFace models (GPT-2, Llama, Mistral, Qwen2, Phi, Gemma), ONNX models, numpy arrays, or the fluent GraphBuilder API.
 
 **Output**: Combinational core, sequential ROM+MAC, serial I/O wrapper, Tiny Tapeout interface.
 
@@ -56,15 +56,23 @@ Architecturally supports the building blocks used in modern LLMs (DeepSeek, Llam
 
 **Testbench generation**: Automated Verilog testbenches with golden vectors from the quantized model, VCD waveform dump, tolerance checking, and sequential mode support.
 
+**Auto-fit**: Given a model and a target FPGA device, automatically finds the best quantization, mixed precision, sparsity, and compilation mode to make the design fit. Runs per-layer sensitivity analysis, then greedily optimizes.
+
+**Build pipeline**: One-command flow from model to bitstream: quantize, compile, simulate (Icarus Verilog), synthesize (Yosys), place-and-route (nextpnr), bitstream generation. Detects installed tools, reports pass/fail per stage.
+
 > **Note:** Sequential mode currently supports Dense, Conv1D, and Conv2D layers (with fused ReLU). Other operations use combinational logic.
 
 ## Quick start
 
 ```bash
-pip install numpy     # only required dependency (onnx optional)
+pip install numpy                     # only required dependency
+pip install huggingface_hub safetensors  # optional: for HuggingFace models
 
+# Compile GPT-2 to Verilog in one command
+python -m w2s compile hf://openai-community/gpt2 --mode sequential --bits 8
+
+# Or run the examples
 python examples/xor_demo.py           # simplest demo
-python examples/xor_graph_demo.py     # same, using graph API
 python examples/mnist_cnn_demo.py     # CNN compiled to silicon
 python examples/sequential_demo.py    # sequential mode comparison
 python examples/real_model_demo.py    # GPT-2 compiled to silicon
@@ -78,6 +86,39 @@ python -m w2s estimate model.onnx --mode both
 python -m w2s info model.onnx
 python -m w2s testbench model.onnx --vectors 8 --vcd
 ```
+
+### HuggingFace direct import
+
+Compile any supported HuggingFace model by ID — no ONNX export needed:
+
+```bash
+python -m w2s compile hf://openai-community/gpt2 --mode sequential --bits 8
+python -m w2s info hf://TinyLlama/TinyLlama-1.1B-Chat-v1.0
+```
+
+Supported architectures: GPT-2, Llama, Mistral, Qwen2, Phi, Gemma.
+
+### Auto-fit
+
+Automatically find the best quantization, sparsity, and mode to fit a target device:
+
+```bash
+python -m w2s autofit model.onnx --device ecp5-25k
+python -m w2s autofit hf://openai-community/gpt2 --device ice40up5k
+```
+
+Runs per-layer sensitivity analysis, then greedily downgrades the least-sensitive layers to int4 and applies sparsity until the design fits.
+
+### End-to-end build
+
+One command: quantize, compile, simulate, synthesize, route, bitstream:
+
+```bash
+python -m w2s build model.onnx --device ice40up5k
+python -m w2s build hf://openai-community/gpt2 --device ecp5-25k --mode sequential
+```
+
+Detects installed tools (Yosys, nextpnr, Icarus Verilog) and runs each stage with clear pass/fail reporting. Skips stages when tools are missing.
 
 ### Mixed precision
 
@@ -94,6 +135,40 @@ Generate builds for real hardware (iCE40, ECP5) with Makefiles and pin constrain
 ```bash
 python -m w2s compile model.onnx --target fpga --device ecp5-25k --mode sequential
 python -m w2s estimate model.onnx --target fpga --device ice40up5k
+```
+
+## Load a HuggingFace model
+
+```python
+from w2s.importers.hf_import import load_hf
+from w2s.quantize import quantize_graph
+from w2s.graph import compile_graph
+
+graph = load_hf("openai-community/gpt2", blocks=[0])
+quantize_graph(graph, {"token_embed": calibration_data})
+compile_graph(graph, "output/", mode="sequential")
+```
+
+## Auto-fit to a device
+
+```python
+from w2s.importers.hf_import import load_hf
+from w2s.autofit import autofit_fpga
+from w2s.fpga import ECP5_25K
+
+graph = load_hf("openai-community/gpt2", blocks=[0])
+calib = {"token_embed": np.random.randn(4, 768).astype(np.float32)}
+result = autofit_fpga(graph, calib, ECP5_25K)
+print(result)  # mode, bits_map, sparsity, area estimate, fit status
+```
+
+## End-to-end build pipeline
+
+```python
+from w2s.pipeline import build
+
+result = build(graph, calib, output_dir="./build", target="ice40up5k")
+print(result)  # per-stage pass/fail, timing, output files
 ```
 
 ## Build a model with the GraphBuilder API
@@ -206,7 +281,8 @@ Every weight is a literal constant. No RAM, no ROM, no bus. The model IS the cir
 - GPT-2 block 0: **5.9M pre-trained weights** compiled in ~5 seconds
 - Area estimator: **~99% accuracy** vs actual Yosys gate count on tested designs
 - Sequential mode: significantly fewer gates than combinational for same network
-- **116 automated tests** covering quantization, compilation, estimation, sparsity, FPGA targeting, mixed precision, and testbench generation
+- **168 automated tests** covering quantization, compilation, estimation, sparsity, FPGA targeting, mixed precision, testbench generation, HuggingFace import, auto-fit, and build pipeline
+- Tested end-to-end: HuggingFace download → quantize → forward_int (with MHA) → sequential Verilog for real GPT-2
 
 ## Architecture
 
@@ -220,6 +296,8 @@ w2s/
   estimate.py          — Sparsity-aware area/gate estimation and Tiny Tapeout fit check
   sparsity.py          — Sparsity analysis, pruning, structured 2:4 enforcement
   fpga.py              — FPGA resource estimation, build scripts, pin constraints
+  autofit.py           — Auto-fit: sensitivity analysis + greedy search for target device
+  pipeline.py          — End-to-end build: quantize → compile → simulate → synthesize → bitstream
   __main__.py          — CLI tool (python -m w2s)
   sequential/
     compile.py         — Sequential ROM+MAC compiler with $readmemh
@@ -236,6 +314,7 @@ w2s/
   importers/
     builder.py         — Fluent GraphBuilder API
     onnx_import.py     — ONNX model import
+    hf_import.py       — HuggingFace model import (GPT-2, Llama, Mistral, etc.)
 ```
 
 ## Cheers to the future
