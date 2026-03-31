@@ -173,7 +173,7 @@ def generate_conv2d(
                         f"  // bias[{co}]={fb:+.4f}" if fb is not None
                         else f"  // bias[{co}]"
                     )
-                    terms.append(f"{slit(acc_bits, bval)}{bcmt}")
+                    terms.append(f"{slit(acc_bits, bval)};{bcmt}")
 
                 # emit accumulator
                 if not terms:
@@ -359,7 +359,7 @@ def generate_conv1d(
                     f"  // bias[{co}]={fb:+.4f}" if fb is not None
                     else f"  // bias[{co}]"
                 )
-                terms.append(f"{slit(acc_bits, bval)}{bcmt}")
+                terms.append(f"{slit(acc_bits, bval)};{bcmt}")
 
             # emit accumulator
             if not terms:
