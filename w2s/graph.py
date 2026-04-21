@@ -156,24 +156,38 @@ def compile_graph(
     # We'll determine output ports after processing all ops
     # First, generate all op logic
 
+    import inspect
+
     op_lines: List[str] = []
     for op in ops:
         gen = _get_generator(op.op_type)
         if gen is None:
-            op_lines.append(f"    // WARNING: no generator for {op.op_type.value} "
-                          f"(op: {op.name}) — skipped")
-            op_lines.append("")
-            # Pass through input wires as output (best effort)
-            if op.inputs and op.inputs[0] in wire_map:
-                for out_name in op.outputs:
-                    wire_map[out_name] = wire_map[op.inputs[0]]
-            continue
+            raise NotImplementedError(
+                f"No Verilog generator is registered for op_type "
+                f"{op.op_type.value!r} (op {op.name!r}).  Silently passing "
+                f"the input through as the output would produce Verilog "
+                f"that implements the wrong network.  Register a generator "
+                f"in w2s/graph.py _module_map, or remove the op from the "
+                f"graph."
+            )
 
         # Mixed precision: use per-op bits if set, else default
         op_bits = op.attrs.get('bits', default_bits)
 
+        # Pass optional kwargs (hex_dir for generators that emit $readmemh
+        # ROMs) only to generators that declare them.  Keeps the core
+        # signature (op, wire_map, bits) stable for generators that don't
+        # need output-directory access.
+        gen_kwargs = {}
         try:
-            new_lines, new_wires = gen(op, wire_map, op_bits)
+            sig_params = inspect.signature(gen).parameters
+        except (TypeError, ValueError):
+            sig_params = {}
+        if "hex_dir" in sig_params:
+            gen_kwargs["hex_dir"] = str(out)
+
+        try:
+            new_lines, new_wires = gen(op, wire_map, op_bits, **gen_kwargs)
         except Exception as e:
             raise RuntimeError(
                 f"Failed to generate Verilog for op '{op.name}' ({op.op_type.name}): {e}"

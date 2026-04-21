@@ -110,6 +110,28 @@ def _count_q_params(graph):
     return total
 
 
+def _make_calibration_data(graph, batch: int = 4) -> dict:
+    """Build random calibration tensors for every graph input.
+
+    ONNX models (e.g. mnist-12) declare an already-batched shape like
+    ``(1, 1, 28, 28)``, and dynamic batch dims come back as ``-1``.  A naive
+    ``(batch,) + shape`` would produce ``(4, 1, 1, 28, 28)`` or crash on the
+    negative dim, so we replace any leading batch-like axis (``1``, ``0``,
+    or ``-1``) instead of prepending.
+    """
+    calib_data = {}
+    for inp_name in graph.input_names:
+        shape = tuple(graph.input_shapes.get(inp_name, (1,)))
+        if shape and shape[0] in (0, 1, -1):
+            calib_shape = (batch,) + shape[1:]
+        else:
+            calib_shape = (batch,) + shape
+        # Replace any remaining dynamic dims with 1 so randn doesn't fault.
+        calib_shape = tuple(1 if d in (0, -1) else d for d in calib_shape)
+        calib_data[inp_name] = np.random.randn(*calib_shape).astype(np.float32)
+    return calib_data
+
+
 # ---------------------------------------------------------------------------
 #  Command: compile
 # ---------------------------------------------------------------------------
@@ -174,11 +196,7 @@ def cmd_compile(args):
     graph.quant_config = config
 
     # Generate random calibration data and warn the user
-    calib_data = {}
-    for inp_name in graph.input_names:
-        shape = graph.input_shapes.get(inp_name, (1,))
-        calib_shape = (4,) + tuple(shape)
-        calib_data[inp_name] = np.random.randn(*calib_shape).astype(np.float32)
+    calib_data = _make_calibration_data(graph)
 
     print("       WARNING: using random calibration data.  For better accuracy,")
     print("       supply real calibration data from your dataset.")
@@ -253,11 +271,7 @@ def cmd_estimate(args):
     )
     graph.quant_config = config
 
-    calib_data = {}
-    for inp_name in graph.input_names:
-        shape = graph.input_shapes.get(inp_name, (1,))
-        calib_shape = (4,) + tuple(shape)
-        calib_data[inp_name] = np.random.randn(*calib_shape).astype(np.float32)
+    calib_data = _make_calibration_data(graph)
 
     from w2s.quantize import quantize_graph
     graph = quantize_graph(graph, calib_data, config)
@@ -323,11 +337,7 @@ def cmd_testbench(args):
     )
     graph.quant_config = config
 
-    calib_data = {}
-    for inp_name in graph.input_names:
-        shape = graph.input_shapes.get(inp_name, (1,))
-        calib_shape = (4,) + tuple(shape)
-        calib_data[inp_name] = np.random.randn(*calib_shape).astype(np.float32)
+    calib_data = _make_calibration_data(graph)
 
     from w2s.quantize import quantize_graph
     graph = quantize_graph(graph, calib_data, config)
@@ -465,11 +475,7 @@ def cmd_autofit(args):
     print()
 
     # Generate calibration data
-    calib_data = {}
-    for inp_name in graph.input_names:
-        shape = graph.input_shapes.get(inp_name, (1,))
-        calib_shape = (4,) + tuple(shape)
-        calib_data[inp_name] = np.random.randn(*calib_shape).astype(np.float32)
+    calib_data = _make_calibration_data(graph)
 
     # Run auto-fit
     from w2s.fpga import DEVICES
@@ -537,11 +543,7 @@ def cmd_build(args):
     print()
 
     # Generate calibration data
-    calib_data = {}
-    for inp_name in graph.input_names:
-        shape = graph.input_shapes.get(inp_name, (1,))
-        calib_shape = (4,) + tuple(shape)
-        calib_data[inp_name] = np.random.randn(*calib_shape).astype(np.float32)
+    calib_data = _make_calibration_data(graph)
 
     # Select mode
     mode = args.mode

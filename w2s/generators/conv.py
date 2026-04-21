@@ -63,9 +63,25 @@ def generate_conv2d(
     # ---- input wires ---------------------------------------------------
     inp_name = op.inputs[0]
     inp_tw = wire_map[inp_name]
-    # inp_tw.shape == (C_in, H_in, W_in)
-    H_in = inp_tw.shape[1]
-    W_in = inp_tw.shape[2]
+    # Accept (C_in, H_in, W_in) or (N, C_in, H_in, W_in) — an ONNX graph
+    # input often still carries a leading batch dim.  Index from the right so
+    # extra leading dims (which must multiply to 1, since numel is fixed) are
+    # tolerated.
+    shape = tuple(inp_tw.shape)
+    if len(shape) < 2:
+        raise ValueError(
+            f"Conv2D {op.name!r}: input tensor {inp_name!r} has shape {shape}; "
+            f"need at least (H, W)"
+        )
+    H_in, W_in = shape[-2], shape[-1]
+    leading = 1
+    for d in shape[:-2]:
+        leading *= d
+    if leading != C_in:
+        raise ValueError(
+            f"Conv2D {op.name!r}: input channel count (product of leading dims) "
+            f"{leading} does not match weight C_in={C_in} (input shape {shape})"
+        )
 
     # ---- output geometry -----------------------------------------------
     H_out = (H_in + 2 * pH - kH) // sH + 1
@@ -258,8 +274,22 @@ def generate_conv1d(
     # ---- input wires ---------------------------------------------------
     inp_name = op.inputs[0]
     inp_tw = wire_map[inp_name]
-    # inp_tw.shape == (C_in, W_in)
-    W_in = inp_tw.shape[1]
+    # Accept (C_in, W_in) or (N, C_in, W_in) — ONNX graph inputs may carry
+    # a leading batch dim.
+    shape = tuple(inp_tw.shape)
+    if len(shape) < 1:
+        raise ValueError(
+            f"Conv1D {op.name!r}: input tensor {inp_name!r} has shape {shape}"
+        )
+    W_in = shape[-1]
+    leading = 1
+    for d in shape[:-1]:
+        leading *= d
+    if leading != C_in:
+        raise ValueError(
+            f"Conv1D {op.name!r}: input channel count (product of leading dims) "
+            f"{leading} does not match weight C_in={C_in} (input shape {shape})"
+        )
 
     # ---- output geometry -----------------------------------------------
     W_out = (W_in + 2 * pW - kW) // sW + 1

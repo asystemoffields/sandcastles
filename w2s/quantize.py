@@ -246,17 +246,31 @@ def forward_op_float(
         rv = op.weights['running_var']
         scale = op.weights.get('scale')
         bias = op.weights.get('bias')
-        # x shape: (N, C, ...) or (C, ...)
-        # Determine the channel axis -- assume axis 0 if no batch dim,
-        # otherwise axis 1.
-        if x.ndim >= 3:
-            c_axis = 1 if x.shape[0] != len(rm) else 0
-        else:
-            c_axis = 0 if x.shape[0] == len(rm) else -1
+        C = len(rm)
 
-        # Build shape for broadcasting
+        # Channel axis is set explicitly at import time (ONNX spec: axis 1
+        # for (N, C, ...) inputs; use axis 0 for bare (C, ...) inputs).  The
+        # previous heuristic silently misfired when batch happened to equal
+        # channel count.
+        c_axis = int(op.attrs.get('c_axis', 1))
+        if x.ndim == 1:
+            c_axis = 0                      # (C,) has no other axis to use
+        if c_axis < 0:
+            c_axis += x.ndim
+        if not (0 <= c_axis < x.ndim):
+            raise ValueError(
+                f"BatchNorm {op.name!r}: c_axis={op.attrs.get('c_axis')} "
+                f"is out of range for input ndim={x.ndim} (shape {x.shape})"
+            )
+        if x.shape[c_axis] != C:
+            raise ValueError(
+                f"BatchNorm {op.name!r}: input shape {x.shape} has "
+                f"{x.shape[c_axis]} channels at axis {c_axis} but "
+                f"running_mean has length {C}.  Check c_axis attr."
+            )
+
         bc_shape = [1] * x.ndim
-        bc_shape[c_axis] = len(rm)
+        bc_shape[c_axis] = C
         bc_shape = tuple(bc_shape)
 
         rm_b = rm.reshape(bc_shape)
@@ -1006,10 +1020,22 @@ def _compute_mac_requant(
                 bias_q[c] = int(round(bias[c] * bias_scale))
             op.q_weights['bias'] = bias_q
         else:
-            ws = w_scales[0] if len(w_scales) == 1 else w_scales
-            if isinstance(ws, np.ndarray) and ws.size == 1:
-                ws = float(ws)
-            bias_scale = input_scale * float(ws)
+            # Per-tensor path (or weight.ndim < 2): collapse w_scales to one
+            # scalar.  If somehow we still received a multi-element array
+            # here (e.g. a 1-D per-channel weight under PER_CHANNEL), it
+            # means the caller handed us inconsistent config; raise rather
+            # than silently averaging.
+            ws_arr = np.asarray(w_scales).reshape(-1)
+            if ws_arr.size == 1:
+                ws_scalar = float(ws_arr[0])
+            else:
+                raise ValueError(
+                    f"Bias quantization for {op.name!r}: expected scalar "
+                    f"weight scale (per-tensor or 1-D weight) but got "
+                    f"{ws_arr.size} scales.  Check quantization granularity "
+                    f"vs. weight shape {weight.shape}."
+                )
+            bias_scale = input_scale * ws_scalar
             if bias_scale < 1e-30:
                 bias_scale = 1e-30
             op.q_weights['bias'] = np.round(bias * bias_scale).astype(np.int64)

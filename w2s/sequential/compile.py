@@ -54,11 +54,47 @@ def _fuse_ops(ops: List[Operation]) -> List[Operation]:
 #  Identify which ops are "compute layers" (have weights, need MAC)
 # ---------------------------------------------------------------------------
 
-_WEIGHTED_OPS = {OpType.DENSE, OpType.CONV2D, OpType.CONV1D}
+# Ops the sequential state machine actually iterates correctly.  Historically
+# this set also contained CONV1D/CONV2D, but the state machine only advances
+# ``in_idx`` up to C_in per output neuron — it doesn't loop over kernel
+# positions or spatial output pixels, so Conv sequential output is wrong by
+# a factor of kH·kW·H_out·W_out.  Rather than silently emit wrong Verilog we
+# reject Conv in sequential mode; users should compile CNNs in combinational.
+_WEIGHTED_OPS = {OpType.DENSE}
+
+# Structural ops that carry no runtime cost for the sequential pipeline
+# (they're pure data-layout rewrites that happen implicitly because every
+# buffer is already flat).  Anything NOT in this set and NOT weighted is a
+# real op that sequential mode does not implement — we refuse to silently
+# drop it.
+_SEQUENTIAL_PASSTHROUGH = {OpType.RESHAPE, OpType.FLATTEN}
 
 
 def _compute_layers(ops: List[Operation]) -> List[Operation]:
-    """Return only ops that need MAC computation."""
+    """
+    Return only ops that need MAC computation.
+
+    Raises if the op stream contains any op that is neither a weighted
+    compute layer nor a known structural passthrough — sequential mode can
+    only faithfully compile MLP-shaped graphs (Dense with fused ReLU) and
+    silently dropping MaxPool/LayerNorm/Conv/Softmax/etc. would produce
+    Verilog that implements a different network than the graph.
+    """
+    unsupported: List[Tuple[str, str]] = []
+    for op in ops:
+        if op.op_type in _WEIGHTED_OPS:
+            continue
+        if op.op_type in _SEQUENTIAL_PASSTHROUGH:
+            continue
+        unsupported.append((op.name, op.op_type.value))
+    if unsupported:
+        items = ", ".join(f"{n}({t})" for n, t in unsupported)
+        raise NotImplementedError(
+            f"Sequential compile does not support these ops: {items}.  "
+            f"Sequential mode currently handles Dense (with optionally "
+            f"fused ReLU), plus Reshape/Flatten as layout no-ops.  For "
+            f"Conv1D/Conv2D or any other op, use --mode combinational."
+        )
     return [op for op in ops if op.op_type in _WEIGHTED_OPS]
 
 
@@ -246,22 +282,36 @@ def compile_sequential(
     states['OUTPUT'] = idx; idx += 1
     states['DONE_ST'] = idx
 
-    # Collect requant params
-    # Note: sequential mode uses a single MAC, so per-channel requant arrays
-    # are reduced to a single value (mean). This is an approximation; true
-    # per-channel requant would require a per-output-neuron lookup table.
+    # Collect requant params.  Sequential mode uses a single MAC with a
+    # single per-layer multiplier/shift, so it only supports PER-TENSOR
+    # quantization.  Per-channel requant would need a per-output-neuron ROM
+    # indexed by `out_neuron`; until that lands we refuse rather than
+    # silently averaging the channel-specific constants (which is wrong,
+    # especially for shifts which are exponents).
     requant_mults = []
     requant_shifts = []
     activations = []
     for layer in layers:
         rm = layer.q_params.get('requant_mult', 1)
-        if isinstance(rm, np.ndarray):
-            rm = int(rm.mean())
-        requant_mults.append(int(rm))
-
         rs = layer.q_params.get('requant_shift', 16)
+        if isinstance(rm, np.ndarray) and rm.size > 1:
+            raise NotImplementedError(
+                f"Sequential compile of layer {layer.name!r} has a "
+                f"per-channel requant multiplier (shape={rm.shape}); "
+                f"sequential mode currently requires per-tensor "
+                f"quantization.  Re-run with QuantGranularity.PER_TENSOR, "
+                f"or compile in --mode combinational."
+            )
+        if isinstance(rs, np.ndarray) and rs.size > 1:
+            raise NotImplementedError(
+                f"Sequential compile of layer {layer.name!r} has a "
+                f"per-channel requant shift; see the per-channel note above."
+            )
+        if isinstance(rm, np.ndarray):
+            rm = rm.item()
         if isinstance(rs, np.ndarray):
-            rs = int(rs.mean())
+            rs = rs.item()
+        requant_mults.append(int(rm))
         requant_shifts.append(int(rs))
 
         activations.append(layer.attrs.get('activation', 'none'))

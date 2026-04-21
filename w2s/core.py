@@ -189,6 +189,15 @@ class ComputeGraph:
     tensor_scales: Dict[str, float] = field(default_factory=dict)
     tensor_ranges: Dict[str, Tuple[float, float]] = field(default_factory=dict)
 
+    def __post_init__(self):
+        # The graph name is used as a Verilog module name and as a file stem,
+        # so it must be a valid identifier.  Sanitize hyphens/dots/etc.
+        raw = self.name
+        safe = "".join(c if c.isalnum() or c == "_" else "_" for c in raw)
+        if safe and safe[0].isdigit():
+            safe = "m_" + safe
+        self.name = safe or "model"
+
     def add(self, op: Operation) -> "ComputeGraph":
         """Add an operation.  Returns self for chaining."""
         self.operations.append(op)

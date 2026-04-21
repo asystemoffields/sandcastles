@@ -338,7 +338,7 @@ def generate_layernorm(
         pre_sat = f"{p}_pre_{i}"
         lines.append(
             f"    wire signed [{ACC_BITS - 1}:0] {pre_sat} = "
-            f"({emit.slit(ACC_BITS, s_val)} * {normed}) >>> {bits}"
+            f"(({emit.slit(ACC_BITS, s_val)} * {normed}) >>> {bits})"
             f" + {emit.slit(ACC_BITS, b_val)};"
             f"  // s={s_flt:.4f} b={b_flt:.4f}"
         )
@@ -537,6 +537,28 @@ def generate_batchnorm(
     in_tensor = wire_map[op.inputs[0]]
     out_tensor_name = op.outputs[0]
 
+    # -- Resolve channel axis from the explicit op attr ------------------
+    # ``c_axis`` is pinned at import time (1 for ONNX NCHW, 0 for (C,...)
+    # inputs), removing the heuristic that silently mis-identified the
+    # channel dim when batch happened to equal channel count.
+    in_shape = tuple(in_tensor.shape)
+    c_axis = int(op.attrs.get('c_axis', 1))
+    if len(in_shape) == 1:
+        c_axis = 0
+    if c_axis < 0:
+        c_axis += len(in_shape)
+    if not (0 <= c_axis < len(in_shape)):
+        raise ValueError(
+            f"BatchNorm {op.name!r}: c_axis={op.attrs.get('c_axis')} out "
+            f"of range for input shape {in_shape}"
+        )
+    if in_shape[c_axis] != C:
+        raise ValueError(
+            f"BatchNorm {op.name!r}: input shape {in_shape} has "
+            f"{in_shape[c_axis]} channels at axis {c_axis} but BN has "
+            f"C={C}.  Check c_axis attr."
+        )
+
     # -- Fold BN into per-channel affine using quantized scale/bias --
     # At inference: y[c] = (scale/sqrt(var+eps)) * x[c]
     #                    + (bias - scale*mean/sqrt(var+eps))
@@ -567,27 +589,39 @@ def generate_batchnorm(
     p = op.name
 
     lines += emit.section_comment(
-        f"BatchNorm (folded affine): {op.name}  (C={C})"
+        f"BatchNorm (folded affine): {op.name}  shape={in_shape} C={C} "
+        f"c_axis={c_axis}"
     )
-    lines.append(f"    // Folded at compile time: y[c] = bn_w[c]*x[c] + bn_b[c]")
+    lines.append(f"    // Folded at compile time: y = bn_w[c]*x + bn_b[c]")
     lines.append(f"    // bn_w[c] = scale[c] / sqrt(running_var[c] + eps)")
     lines.append(f"    // bn_b[c] = bias[c] - scale[c] * running_mean[c] / sqrt(running_var[c] + eps)")
     lines.append("")
 
-    # -- Sign-extend inputs --
+    # For each flat output position, figure out which channel it belongs
+    # to by decomposing the flat index according to in_shape.  This works
+    # for any ndim: (C,), (C, H, W), (1, C, H, W), (N, C, L), etc.
+    numel = 1
+    for d in in_shape:
+        numel *= d
+    # Strides for C-order (row-major) flat indexing.
+    strides = [1] * len(in_shape)
+    for i in range(len(in_shape) - 2, -1, -1):
+        strides[i] = strides[i + 1] * in_shape[i + 1]
+
+    out_wire_names: List[str] = []
     se_names: List[str] = []
-    for c in range(C):
-        src = in_tensor.wire_names[c]
-        dst = f"{p}_se_{c}"
+
+    # Sign-extend every input wire once.
+    for i in range(numel):
+        src = in_tensor.wire_names[i]
+        dst = f"{p}_se_{i}"
         se_names.append(dst)
         lines.append(emit.sign_extend_wire(src, bits, dst, ACC_BITS))
     lines.append("")
 
-    # -- Per-channel affine: w*x + b, then saturate --
-    out_wire_names: List[str] = []
-
-    for c in range(C):
-        out_wire = f"{p}_out_{c}"
+    for flat in range(numel):
+        c = (flat // strides[c_axis]) % in_shape[c_axis]
+        out_wire = f"{p}_out_{flat}"
         out_wire_names.append(out_wire)
 
         w_val = int(bn_weight_q[c])
@@ -595,35 +629,35 @@ def generate_batchnorm(
         w_flt = float(bn_weight_f[c])
         b_flt = float(bn_bias_f[c])
 
-        lines.append(f"    // --- channel {c}: w={w_flt:.6f} b={b_flt:.6f} ---")
-
-        acc = f"{p}_acc_{c}"
+        acc = f"{p}_acc_{flat}"
 
         if w_val == 0 and b_val == 0:
             lines.append(
                 f"    wire signed [{ACC_BITS - 1}:0] {acc} = {emit.slit(ACC_BITS, 0)};"
+                f"  // pos {flat} c={c}"
             )
         elif w_val == 0:
             lines.append(
                 f"    wire signed [{ACC_BITS - 1}:0] {acc} = "
                 f"{emit.slit(ACC_BITS, b_val)};"
-                f"  // bias only"
+                f"  // pos {flat} c={c} bias only"
             )
         else:
             lines.append(
                 f"    wire signed [{ACC_BITS - 1}:0] {acc} = "
-                f"({emit.slit(ACC_BITS, w_val)} * {se_names[c]}) >>> {bits}"
+                f"(({emit.slit(ACC_BITS, w_val)} * {se_names[flat]}) >>> {bits})"
                 f" + {emit.slit(ACC_BITS, b_val)};"
-                f"  // w={w_flt:.4f} b={b_flt:.4f}"
+                f"  // pos {flat} c={c} w={w_flt:.4f} b={b_flt:.4f}"
             )
 
         lines += emit.saturate_linear(acc, ACC_BITS, out_wire, bits)
-        lines.append("")
+
+    lines.append("")
 
     new_wires = {
         out_tensor_name: TensorWires(
             wire_names=out_wire_names,
-            shape=(C,),
+            shape=in_shape,
             bits=bits,
             signed=True,
         )

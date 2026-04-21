@@ -165,7 +165,10 @@ def _build_attrs_layernorm(node) -> Dict[str, Any]:
 def _build_attrs_batchnorm(node) -> Dict[str, Any]:
     eps = _onnx_attr(node, "epsilon", 1e-5)
     momentum = _onnx_attr(node, "momentum", 0.9)
-    return {"eps": eps, "momentum": momentum}
+    # ONNX BatchNormalization spec: input is (N, C, ...) — channel is axis 1.
+    # Pinning it here kills the ambiguous "is axis 0 batch or channel?" runtime
+    # heuristic in calibration.
+    return {"eps": eps, "momentum": momentum, "c_axis": 1}
 
 
 def _build_attrs_concat(node) -> Dict[str, Any]:
@@ -212,6 +215,64 @@ def _build_attrs_gemm(node) -> Dict[str, Any]:
 #  Fusion pass: detect simple op pairs (e.g., Conv+Relu, Gemm+Relu)
 # ---------------------------------------------------------------------------
 
+def _fuse_bias_adds(nodes: list, inits: Dict[str, np.ndarray]):
+    """
+    Fuse ``Conv/Gemm/MatMul -> Add(bias_initializer)`` into the producer's
+    bias weight.  Some exporters (e.g. the CNTK mnist-12.onnx) emit a bare
+    Conv and a separate Add-of-initializer instead of using Conv's optional
+    bias input; without fusion the Add has a missing runtime input.
+
+    Returns (new_node_list, output_renames) just like ``_fuse_activations``.
+    """
+    consumers: Dict[str, List] = {}
+    for n in nodes:
+        for inp in n.input:
+            consumers.setdefault(inp, []).append(n)
+
+    fusable_producers = {"Conv", "Gemm", "MatMul"}
+    # Index-based set so there's no ambiguity between str names and id() ints,
+    # and no risk of id() reuse across passes if objects were GC'd.
+    node_idx = {id(n): i for i, n in enumerate(nodes)}
+    fused_set: Set[int] = set()
+    output_renames: Dict[str, str] = {}
+
+    for i, n in enumerate(nodes):
+        if n.op_type not in fusable_producers:
+            continue
+        if len(n.output) != 1:
+            continue
+        # Skip if producer already has a bias input.
+        if n.op_type in ("Conv", "Gemm") and len(n.input) >= 3 and n.input[2]:
+            continue
+        out_name = n.output[0]
+        users = consumers.get(out_name, [])
+        if len(users) != 1:
+            continue
+        add_node = users[0]
+        if add_node.op_type != "Add" or len(add_node.input) != 2:
+            continue
+        # Identify which Add operand is the initializer bias.
+        other_idx = 1 if add_node.input[0] == out_name else 0
+        bias_name = add_node.input[other_idx]
+        if bias_name not in inits:
+            continue
+        bias = np.asarray(inits[bias_name]).squeeze()
+        if bias.ndim != 1:
+            continue                       # not a simple broadcast bias
+        # Attach bias as a synthetic third input to the producer.
+        new_bias_name = f"{bias_name}__fused_bias_{i}"
+        inits[new_bias_name] = bias
+        while len(n.input) < 2:
+            n.input.append("")
+        n.input.append(new_bias_name)
+        if len(add_node.output) == 1:
+            output_renames[add_node.output[0]] = out_name
+        fused_set.add(node_idx[id(add_node)])
+
+    new_nodes = [n for i, n in enumerate(nodes) if i not in fused_set]
+    return new_nodes, output_renames
+
+
 def _fuse_activations(nodes: list, inits: Dict[str, np.ndarray]):
     """
     One-pass fusion: when a producer (Conv/Gemm/MatMul) has exactly one
@@ -230,7 +291,8 @@ def _fuse_activations(nodes: list, inits: Dict[str, np.ndarray]):
     fusable_producers = {"Conv", "Gemm", "MatMul"}
     fusable_acts = {"Relu": "relu", "Sigmoid": "sigmoid", "Tanh": "tanh"}
 
-    fused_set: Set[str] = set()          # names of deleted activation nodes
+    node_idx = {id(n): i for i, n in enumerate(nodes)}
+    fused_set: Set[int] = set()           # indices of deleted activation nodes
     output_renames: Dict[str, str] = {}   # old act output -> producer output
 
     for n in nodes:
@@ -253,14 +315,10 @@ def _fuse_activations(nodes: list, inits: Dict[str, np.ndarray]):
         # Map the activation's output to the producer's output.
         if len(act_node.output) == 1:
             output_renames[act_node.output[0]] = out_name
-        fused_set.add(act_node.name or id(act_node))
+        fused_set.add(node_idx[id(act_node)])
 
     # Build a new node list without the fused activation nodes.
-    new_nodes = []
-    for n in nodes:
-        key = n.name or id(n)
-        if key not in fused_set:
-            new_nodes.append(n)
+    new_nodes = [n for i, n in enumerate(nodes) if i not in fused_set]
 
     return new_nodes, output_renames
 
@@ -377,9 +435,101 @@ def load_onnx(path: str, name: str = None) -> ComputeGraph:
         if s is not None:
             shape_map[vi.name] = s
 
-    # --- Fusion pass ---
+    # --- Pre-passes: constant-fold + structural no-op absorption ---
+    # 1. Promote `Constant` nodes to initializers.  Their output is the
+    #    attribute `value` tensor; downstream consumers can then treat them
+    #    like any other weight.
+    # 2. Constant-fold `Reshape` and `Transpose` when all non-data inputs are
+    #    initializers (common for weight pre-processing in exports).
+    # 3. Record `Identity` as an output→input rename; the node vanishes.
+    # Anything else that isn't in _OPTYPE_MAP is a genuine unknown and will
+    # raise downstream — we never silently drop an unrecognized compute op.
     nodes = list(g.node)
-    nodes, output_renames = _fuse_activations(nodes, inits)
+    folded: Set[int] = set()
+    pre_renames: Dict[str, str] = {}
+
+    for idx, n in enumerate(nodes):
+        op = n.op_type
+        out = n.output[0] if len(n.output) >= 1 else None
+
+        if op == "Constant":
+            # Attribute "value" is the constant tensor.
+            val = _onnx_attr(n, "value")
+            if isinstance(val, np.ndarray) and out is not None:
+                inits[out] = val
+                init_names.add(out)
+                folded.add(idx)
+            continue
+
+        if op == "Identity":
+            if out is not None and len(n.input) >= 1:
+                if n.input[0] in inits:
+                    # Aliasing an initializer: copy rather than rename so
+                    # downstream init-lookups succeed by output name.
+                    inits[out] = inits[n.input[0]]
+                    init_names.add(out)
+                else:
+                    pre_renames[out] = n.input[0]
+                folded.add(idx)
+            continue
+
+        if op == "Reshape" and len(n.input) >= 2 and out is not None:
+            if n.input[0] in inits and n.input[1] in inits:
+                data = inits[n.input[0]]
+                target = tuple(int(x) for x in inits[n.input[1]])
+                try:
+                    inits[out] = data.reshape(target)
+                    init_names.add(out)
+                    folded.add(idx)
+                except ValueError:
+                    pass                  # shape mismatch — leave node in place
+            continue
+
+        if op == "Transpose" and len(n.input) >= 1 and out is not None:
+            if n.input[0] in inits:
+                perm = _onnx_attr(n, "perm")
+                data = inits[n.input[0]]
+                try:
+                    if perm is None:
+                        inits[out] = np.transpose(data)
+                    else:
+                        inits[out] = np.transpose(data, tuple(perm))
+                    init_names.add(out)
+                    folded.add(idx)
+                except ValueError:
+                    pass
+            # Runtime Transpose (non-initializer input) is a genuine op we
+            # don't support; leave it in the node list and let the unknown-
+            # op check downstream raise.
+            continue
+
+    nodes = [n for i, n in enumerate(nodes) if i not in folded]
+
+    # Propagate the pre-pass renames into surviving node inputs so later
+    # passes don't have to know they ever existed.
+    def _apply_pre(tensor: str) -> str:
+        seen: Set[str] = set()
+        while tensor in pre_renames and tensor not in seen:
+            seen.add(tensor)
+            tensor = pre_renames[tensor]
+        return tensor
+
+    for n in nodes:
+        for i, inp in enumerate(n.input):
+            if inp in pre_renames:
+                n.input[i] = _apply_pre(inp)
+
+    # --- Fusion passes (bias Add first, so activation fusion sees the new
+    # single-consumer producer output) ---
+    nodes, bias_renames = _fuse_bias_adds(nodes, inits)
+    # Apply bias renames to surviving node inputs so the next fusion sees
+    # Conv → Relu directly instead of Conv → (deleted Add) → Relu.
+    for n in nodes:
+        for i, inp in enumerate(n.input):
+            if inp in bias_renames:
+                n.input[i] = bias_renames[inp]
+    nodes, act_renames = _fuse_activations(nodes, inits)
+    output_renames = {**bias_renames, **act_renames}
 
     # Build a helper to apply renames transitively.
     def _resolve(tensor: str) -> str:
@@ -410,8 +560,16 @@ def load_onnx(path: str, name: str = None) -> ComputeGraph:
     for node in nodes:
         onnx_op = node.op_type
         if onnx_op not in _OPTYPE_MAP:
-            # Skip ops we don't handle (Constant, Identity, etc.)
-            continue
+            raise NotImplementedError(
+                f"ONNX op {onnx_op!r} is not supported by the w2s importer "
+                f"(node {node.name!r}, output {list(node.output)!r}).  "
+                f"Silently dropping unknown ops would produce Verilog that "
+                f"silently computes a different network, so this is a hard "
+                f"error.  Supported ops: "
+                f"{sorted(_OPTYPE_MAP.keys())}.  No-op / structural ops "
+                f"handled at import: Constant, Identity, Reshape (with "
+                f"initializer inputs), Transpose (with initializer input)."
+            )
 
         op_type = _OPTYPE_MAP[onnx_op]
 

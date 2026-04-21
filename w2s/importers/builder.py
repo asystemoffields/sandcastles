@@ -214,14 +214,23 @@ class GraphBuilder:
         running_mean: np.ndarray,
         running_var: np.ndarray,
         eps: float = 1e-5,
+        c_axis: int = 1,
         name: str = None,
     ) -> str:
+        """
+        Construct a BatchNorm op.
+
+        ``c_axis`` is the channel axis of the runtime input tensor (ONNX
+        convention: 1 for (N, C, ...); use 0 for bare (C, ...) inputs).
+        Making the axis explicit avoids a shape-dependent heuristic at
+        calibration time.
+        """
         op_name = self._auto_name("batchnorm", name)
         return self._add_op(
             OpType.BATCHNORM,
             op_name,
             [input],
-            attrs={"eps": eps},
+            attrs={"eps": eps, "c_axis": int(c_axis)},
             weights={
                 "scale": np.asarray(scale),
                 "bias": np.asarray(bias),
