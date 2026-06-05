@@ -1159,8 +1159,39 @@ def _compute_norm_requant(
     input_scale = tensor_scales.get(input_name, 1.0)
     output_scale = tensor_scales.get(output_name, 1.0)
 
-    # Norm layers have a scale (gamma) tensor -- use its mean magnitude
-    # as a proxy for the weight scale in the requantization math.
+    if op.op_type in (OpType.LAYERNORM, OpType.RMSNORM):
+        # LayerNorm/RMSNorm normalise to a dimensionless value n = (x-mean)/std,
+        # so the input scale cancels.  The hardware computes
+        #   out = gamma_q * n + beta_q
+        # (see generators/norm.py), so gamma and beta must be quantised at the
+        # OUTPUT scale -- NOT at their own abs-max (the old behaviour, which
+        # also collapsed per-channel gamma to a single mean scale and produced
+        # an output off by gamma_scale/out_scale on every channel).
+        clip_lim = (1 << 30) - 1
+
+        def _q_at(arr):
+            return np.clip(np.round(np.asarray(arr, dtype=np.float64) * output_scale),
+                           -clip_lim, clip_lim).astype(np.int64)
+
+        scale_w = op.weights.get('scale')
+        if scale_w is not None:
+            op.q_weights['scale'] = _q_at(scale_w)
+        bias_w = op.weights.get('bias')
+        if bias_w is not None:
+            op.q_weights['bias'] = _q_at(bias_w)
+
+        a_bits = acc_bits_for(
+            int(scale_w.shape[0]) if scale_w is not None else 1, bits)
+        op.q_params = {
+            'requant_mult': 1,            # affine handled directly in the generator
+            'requant_shift': 0,
+            'input_scale': float(input_scale),
+            'output_scale': float(output_scale),
+            'acc_bits': a_bits,
+        }
+        return
+
+    # BatchNorm: folded into a per-channel affine; keep the existing scheme.
     scale_w = op.weights.get('scale')
     if scale_w is not None:
         q_arr, ws = quantize_tensor(scale_w, bits, scheme, granularity, axis=0)

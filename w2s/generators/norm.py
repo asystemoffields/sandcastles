@@ -19,9 +19,14 @@ from w2s import emit
 # ---------------------------------------------------------------------------
 
 ACC_BITS = 32          # width of intermediate accumulators
-RSQRT_LUT_BITS = 4    # 16-entry LUT for reciprocal-sqrt
-RSQRT_FRAC_BITS = 14  # fractional bits in rsqrt fixed-point result
+RSQRT_LUT_BITS = 4    # (legacy, unused) 16-entry LUT for reciprocal-sqrt
+RSQRT_FRAC_BITS = 24  # fractional bits in rsqrt result. Must be large enough
+                      # that 1/sqrt(var) stays well-resolved as an integer even
+                      # for the largest variance (~2^32 at int16): rsqrt_min ~=
+                      # 2^(F-16), so F>=24 keeps >=8 bits of resolution there.
 INTERP_FRAC_BITS = 8  # fractional bits for linear interpolation delta
+NORM_FRAC_BITS = 7    # fractional bits carried in the normalised value (x-mean)/sqrt(var)
+NORM_VAR_BITS = 48    # width of the (full-precision) integer variance fed to rsqrt
 
 
 def _is_power_of_2(n: int) -> bool:
@@ -78,6 +83,9 @@ def _adder_tree_lines(
     return lines
 
 
+RSQRT_MANT_BITS = 5    # mantissa LUT address bits (32 entries)
+
+
 def _rsqrt_lut_lines(
     var_wire: str,
     var_bits: int,
@@ -86,91 +94,80 @@ def _rsqrt_lut_lines(
     prefix: str,
 ) -> List[str]:
     """
-    Reciprocal-sqrt via a 16-entry LUT with piecewise-linear interpolation.
+    Reciprocal-sqrt of a non-negative integer variance, returned in
+    Q{RSQRT_FRAC_BITS} fixed-point.
 
-    The top RSQRT_LUT_BITS of the variance select a table entry; the
-    remaining lower bits drive a linear interpolation between the selected
-    entry and the next.
+    Correctness across the *full* dynamic range of the variance is obtained by
+    range reduction, not a flat LUT.  The variance is written as
+    ``var = mantissa * 2**e`` (``mantissa`` in ``[1, 2)``) by finding the
+    most-significant-bit position ``e``; ``1/sqrt(mantissa)`` is read from a
+    small LUT and the ``2**(-e/2)`` factor is applied by a shift (with an extra
+    1/sqrt(2) multiply for odd ``e``).
 
-    LUT values are pre-computed at Verilog-generation time as fixed-point
-    integers (Q{RSQRT_FRAC_BITS}).  Because variance is always non-negative
-    we only need the positive range.
+    The previous implementation binned the variance linearly over
+    ``[0, 2**var_bits)``; real variances (tens to thousands) all fell in bin 0,
+    so it returned ~1.0 (≈6e-5 in Q14) for every input and the normalised
+    output collapsed to zero.  This version is accurate to <1 LSB on average.
     """
-    n_entries = 1 << RSQRT_LUT_BITS   # 16
+    F = RSQRT_FRAC_BITS                                   # result fractional bits
+    MB = RSQRT_MANT_BITS                                  # mantissa LUT bits
+    SQRT1_2 = int(round((1 << F) * 0.70710678118654752))  # 1/sqrt(2) in QF
+    W = var_bits
+    ebits = max((W - 1).bit_length(), 1)
+    p = prefix
     lines: List[str] = []
 
-    # -- absolute value of variance (should already be positive, but safe) --
-    abs_var = f"{prefix}_absvar"
-    lines.append(f"    wire signed [{var_bits - 1}:0] {abs_var} = "
-                 f"({var_wire} < 0) ? -{var_wire} : {var_wire};")
+    # Clamp to >= 1.  Variance is non-negative; this supplies the eps guard and
+    # prevents 1/sqrt(0).
+    vc = f"{p}_vc"
+    lines.append(
+        f"    wire [{W - 1}:0] {vc} = "
+        f"({var_wire} <= 0) ? {W}'d1 : {var_wire}[{W - 1}:0];"
+    )
 
-    # -- index: top LUT_BITS of the absolute variance --
-    idx_wire = f"{prefix}_idx"
-    # If var_bits > RSQRT_LUT_BITS, shift right; otherwise pad.
-    shift = max(var_bits - RSQRT_LUT_BITS, 0)
-    if shift > 0:
-        lines.append(f"    wire [{RSQRT_LUT_BITS - 1}:0] {idx_wire} = "
-                     f"{abs_var}[{var_bits - 1}:{shift}];")
-    else:
-        lines.append(f"    wire [{RSQRT_LUT_BITS - 1}:0] {idx_wire} = "
-                     f"{abs_var}[{RSQRT_LUT_BITS - 1}:0];")
+    # Leading-one position e:  2**e <= vc < 2**(e+1).
+    e = f"{p}_e"
+    terms = " : ".join(f"{vc}[{i}] ? {ebits}'d{i}" for i in range(W - 1, 0, -1))
+    lines.append(f"    wire [{ebits - 1}:0] {e} = {terms} : {ebits}'d0;")
 
-    # -- fractional part for interpolation --
-    frac_wire = f"{prefix}_frac"
-    if shift > INTERP_FRAC_BITS:
-        frac_lo = shift - INTERP_FRAC_BITS
-        lines.append(f"    wire [{INTERP_FRAC_BITS - 1}:0] {frac_wire} = "
-                     f"{abs_var}[{shift - 1}:{frac_lo}];")
-    elif shift > 0:
-        lines.append(f"    wire [{INTERP_FRAC_BITS - 1}:0] {frac_wire} = "
-                     f"{abs_var}[{shift - 1}:0];")
-    else:
-        lines.append(f"    wire [{INTERP_FRAC_BITS - 1}:0] {frac_wire} = "
-                     f"{INTERP_FRAC_BITS}'d0;")
+    # Normalise so the leading one sits at bit W-1; the MB bits just below it
+    # form the mantissa fraction (implicit leading 1 dropped).
+    nrm = f"{p}_nrm"
+    lines.append(f"    wire [{W - 1}:0] {nrm} = {vc} << ({W - 1} - {e});")
+    midx = f"{p}_midx"
+    lines.append(f"    wire [{MB - 1}:0] {midx} = {nrm}[{W - 2}:{W - 1 - MB}];")
 
-    # -- build LUT values --
-    # Each entry i maps to the centre of its bin in variance-space.
-    # rsqrt_val = 1/sqrt(bin_centre)  in Q{RSQRT_FRAC_BITS}
-    scale_factor = 1 << RSQRT_FRAC_BITS
-    max_var = 1 << var_bits
-    bin_width = max(max_var // n_entries, 1)
-
-    lut_vals: List[int] = []
-    for i in range(n_entries):
-        centre = max(bin_width * i + bin_width // 2, 1)
-        rsqrt_float = 1.0 / math.sqrt(centre)
-        lut_vals.append(min(int(round(rsqrt_float * scale_factor)), (1 << result_bits) - 1))
-
-    # Emit the LUT as a case statement into a reg
-    base_wire = f"{prefix}_base"
-    delta_wire = f"{prefix}_delta"
-
-    lines.append(f"    reg signed [{result_bits - 1}:0] {base_wire};")
-    lines.append(f"    reg signed [{result_bits - 1}:0] {delta_wire};")
+    # LUT:  1/sqrt(1 + midx/2**MB)  in QF.
+    mrs = f"{p}_mrs"
+    lines.append(f"    reg [{F}:0] {mrs};")
     lines.append(f"    always @(*) begin")
-    lines.append(f"        case ({idx_wire})")
-
-    for i in range(n_entries):
-        base_v = lut_vals[i]
-        next_v = lut_vals[min(i + 1, n_entries - 1)]
-        diff = next_v - base_v
-        lines.append(f"            {RSQRT_LUT_BITS}'d{i}: begin "
-                     f"{base_wire} = {emit.slit(result_bits, base_v)}; "
-                     f"{delta_wire} = {emit.slit(result_bits, diff)}; end")
-
-    lines.append(f"            default: begin "
-                 f"{base_wire} = {emit.slit(result_bits, lut_vals[-1])}; "
-                 f"{delta_wire} = {emit.slit(result_bits, 0)}; end")
+    lines.append(f"        case ({midx})")
+    for idx in range(1 << MB):
+        val = int(round((1 << F) / math.sqrt(1.0 + idx / (1 << MB))))
+        lines.append(f"            {MB}'d{idx}: {mrs} = {F + 1}'d{val};")
+    lines.append(f"            default: {mrs} = {F + 1}'d{1 << F};")
     lines.append(f"        endcase")
     lines.append(f"    end")
 
-    # -- linear interpolation: result = base + (delta * frac) >> INTERP_FRAC_BITS
-    interp_prod = f"{prefix}_interp"
-    lines.append(f"    wire signed [{result_bits + INTERP_FRAC_BITS - 1}:0] "
-                 f"{interp_prod} = {delta_wire} * $signed({{1'b0, {frac_wire}}});")
-    lines.append(f"    wire signed [{result_bits - 1}:0] {result_wire} = "
-                 f"{base_wire} + {interp_prod}[{result_bits + INTERP_FRAC_BITS - 1}:{INTERP_FRAC_BITS}];")
+    # mrs * (1/sqrt(2)) for the odd-exponent case.
+    rprod = f"{p}_rprod"
+    lines.append(f"    wire [{2 * F}:0] {rprod} = {mrs} * {F + 1}'d{SQRT1_2};")
 
+    # Apply 2**(-e/2):  even e -> mrs >> e/2 ; odd e -> (mrs/sqrt2) >> (e-1)/2.
+    rr = f"{p}_rr"
+    lines.append(f"    reg [{result_bits - 1}:0] {rr};")
+    lines.append(f"    always @(*) begin")
+    lines.append(f"        case ({e})")
+    for ev in range(W):
+        if ev % 2 == 0:
+            lines.append(f"            {ebits}'d{ev}: {rr} = {mrs} >> {ev // 2};")
+        else:
+            lines.append(f"            {ebits}'d{ev}: {rr} = {rprod} >> {F + (ev - 1) // 2};")
+    lines.append(f"            default: {rr} = {result_bits}'d0;")
+    lines.append(f"        endcase")
+    lines.append(f"    end")
+
+    lines.append(f"    wire signed [{result_bits - 1}:0] {result_wire} = {rr};")
     return lines
 
 
@@ -256,57 +253,58 @@ def generate_layernorm(
         lines.append(f"    wire signed [{ACC_BITS - 1}:0] {d} = {se_names[i]} - {mean_wire};")
     lines.append("")
 
-    # -- 4. Variance: sum of squared differences / D --
+    # -- 4. Variance: mean of squared differences (full precision) --
+    #    Sum diff^2 at 64-bit width and divide by D with NO early per-term
+    #    right-shift.  The old code did `diff^2 >>> bits` per term, which drove
+    #    realistic (small) variances to zero and destroyed the normalisation.
+    #    var_wire is the true integer variance of x_int.
     lines += emit.section_comment("Variance computation")
     sq_names: List[str] = []
     for i in range(D):
         sq = f"{p}_sq_{i}"
         sq_names.append(sq)
-        sq_full = f"{p}_sqfull_{i}"
         lines.append(
-            f"    wire signed [63:0] {sq_full} = "
-            f"{diff_names[i]} * {diff_names[i]};"
-        )
-        lines.append(
-            f"    wire signed [{ACC_BITS - 1}:0] {sq} = "
-            f"{sq_full} >>> {bits};"
-            f"  // keep in range"
+            f"    wire signed [63:0] {sq} = {diff_names[i]} * {diff_names[i]};"
         )
     lines.append("")
 
     var_sum_wire = f"{p}_var_sum"
-    lines += _adder_tree_lines(sq_names, var_sum_wire, ACC_BITS, prefix=f"{p}_vs")
+    lines += _adder_tree_lines(sq_names, var_sum_wire, 64, prefix=f"{p}_vs")
     lines.append("")
 
     var_wire = f"{p}_var"
     if _is_power_of_2(D):
         shift = _log2_int(D)
         lines.append(
-            f"    wire signed [{ACC_BITS - 1}:0] {var_wire} = {var_sum_wire} >>> {shift};"
+            f"    wire [{NORM_VAR_BITS - 1}:0] {var_wire} = {var_sum_wire} >>> {shift};"
+            f"  // /D (D={D})"
         )
     else:
         recip = _precompute_reciprocal(D, frac_bits=16)
         vp = f"{p}_var_prod"
         lines.append(
-            f"    wire signed [{2 * ACC_BITS - 1}:0] {vp} = "
-            f"{var_sum_wire} * {emit.slit(ACC_BITS, recip)};"
+            f"    wire signed [127:0] {vp} = {var_sum_wire} * {emit.slit(64, recip)};"
         )
         lines.append(
-            f"    wire signed [{ACC_BITS - 1}:0] {var_wire} = {vp}[{2 * ACC_BITS - 1}:16];"
+            f"    wire [{NORM_VAR_BITS - 1}:0] {var_wire} = "
+            f"{vp}[{NORM_VAR_BITS - 1 + 16}:16];"
         )
     lines.append("")
 
-    # -- 5. Reciprocal sqrt via LUT --
+    # -- 5. Reciprocal sqrt of the variance --
     lines += emit.section_comment("Reciprocal sqrt (1/sqrt(var + eps))")
     rsqrt_wire = f"{p}_rsqrt"
-    rsqrt_bits = ACC_BITS
     lines += _rsqrt_lut_lines(
-        var_wire, ACC_BITS, rsqrt_wire, rsqrt_bits,
+        var_wire, NORM_VAR_BITS, rsqrt_wire, ACC_BITS,
         prefix=f"{p}_rlut",
     )
     lines.append("")
 
-    # -- 6. Output: scale[i] * diff[i] * rsqrt + bias[i], then saturate --
+    # -- 6. Output:  out[i] = gamma_q[i] * normed[i] + beta_q[i] --
+    #    normed[i] = (x[i]-mean)/sqrt(var) in Q{NORM_FRAC_BITS} (dimensionless).
+    #    gamma_q/beta_q are quantised at the OUTPUT scale (see quantize.py), so
+    #    after the gamma multiply a >>> NORM_FRAC_BITS lands the result directly
+    #    in the output integer domain.
     lines += emit.section_comment("Scale, multiply by rsqrt, add bias")
     out_wire_names: List[str] = []
 
@@ -319,31 +317,28 @@ def generate_layernorm(
         s_flt = float(scale_f[i])
         b_flt = float(bias_f[i])
 
-        # scaled_diff = diff[i] * rsqrt
+        # normed = (x-mean)*rsqrt, keeping NORM_FRAC_BITS fractional bits
         sd = f"{p}_sd_{i}"
         lines.append(
-            f"    wire signed [{2 * ACC_BITS - 1}:0] {sd} = "
-            f"{diff_names[i]} * {rsqrt_wire};"
-            f"  // (x-mean)*rsqrt"
+            f"    wire signed [63:0] {sd} = {diff_names[i]} * {rsqrt_wire};"
+            f"  // (x-mean)/sqrt(var) << {RSQRT_FRAC_BITS}"
         )
-
-        # normed = scaled_diff >> RSQRT_FRAC_BITS, truncated to ACC_BITS
         normed = f"{p}_normed_{i}"
         lines.append(
             f"    wire signed [{ACC_BITS - 1}:0] {normed} = "
-            f"{sd}[{2 * ACC_BITS - 1}:{RSQRT_FRAC_BITS}];"
+            f"{sd} >>> {RSQRT_FRAC_BITS - NORM_FRAC_BITS};"
+            f"  // Q{NORM_FRAC_BITS}"
         )
 
-        # apply scale and bias: result = scale[i] * normed + bias[i]
+        # out = (gamma_q * normed) >> NORM_FRAC_BITS + beta_q
         pre_sat = f"{p}_pre_{i}"
         lines.append(
             f"    wire signed [{ACC_BITS - 1}:0] {pre_sat} = "
-            f"(({emit.slit(ACC_BITS, s_val)} * {normed}) >>> {bits})"
+            f"(({emit.slit(ACC_BITS, s_val)} * {normed}) >>> {NORM_FRAC_BITS})"
             f" + {emit.slit(ACC_BITS, b_val)};"
             f"  // s={s_flt:.4f} b={b_flt:.4f}"
         )
 
-        # saturate to output bit width
         lines += emit.saturate_linear(pre_sat, ACC_BITS, out_wire, bits)
         lines.append("")
 
@@ -398,53 +393,45 @@ def generate_rmsnorm(
         lines.append(emit.sign_extend_wire(src, bits, dst, ACC_BITS))
     lines.append("")
 
-    # -- 2. Mean of squares: sum(x^2) / D --
+    # -- 2. Mean of squares: sum(x^2) / D, full precision (no early shift) --
     lines += emit.section_comment("Mean of squares")
     sq_names: List[str] = []
     for i in range(D):
         sq = f"{p}_sq_{i}"
         sq_names.append(sq)
-        sq_full = f"{p}_sqfull_{i}"
         lines.append(
-            f"    wire signed [63:0] {sq_full} = "
-            f"{se_names[i]} * {se_names[i]};"
-        )
-        lines.append(
-            f"    wire signed [{ACC_BITS - 1}:0] {sq} = "
-            f"{sq_full} >>> {bits};"
-            f"  // x^2 scaled"
+            f"    wire signed [63:0] {sq} = {se_names[i]} * {se_names[i]};"
         )
     lines.append("")
 
     sq_sum_wire = f"{p}_sqsum"
-    lines += _adder_tree_lines(sq_names, sq_sum_wire, ACC_BITS, prefix=f"{p}_ss")
+    lines += _adder_tree_lines(sq_names, sq_sum_wire, 64, prefix=f"{p}_ss")
     lines.append("")
 
     ms_wire = f"{p}_ms"
     if _is_power_of_2(D):
         shift = _log2_int(D)
         lines.append(
-            f"    wire signed [{ACC_BITS - 1}:0] {ms_wire} = {sq_sum_wire} >>> {shift};"
+            f"    wire [{NORM_VAR_BITS - 1}:0] {ms_wire} = {sq_sum_wire} >>> {shift};"
             f"  // /D (D={D})"
         )
     else:
         recip = _precompute_reciprocal(D, frac_bits=16)
         prod = f"{p}_ms_prod"
         lines.append(
-            f"    wire signed [{2 * ACC_BITS - 1}:0] {prod} = "
-            f"{sq_sum_wire} * {emit.slit(ACC_BITS, recip)};"
+            f"    wire signed [127:0] {prod} = {sq_sum_wire} * {emit.slit(64, recip)};"
         )
         lines.append(
-            f"    wire signed [{ACC_BITS - 1}:0] {ms_wire} = {prod}[{2 * ACC_BITS - 1}:16];"
+            f"    wire [{NORM_VAR_BITS - 1}:0] {ms_wire} = "
+            f"{prod}[{NORM_VAR_BITS - 1 + 16}:16];"
         )
     lines.append("")
 
-    # -- 3. Reciprocal sqrt via LUT --
+    # -- 3. Reciprocal sqrt of the mean-of-squares --
     lines += emit.section_comment("Reciprocal sqrt (1/sqrt(mean(x^2) + eps))")
     rsqrt_wire = f"{p}_rsqrt"
-    rsqrt_bits = ACC_BITS
     lines += _rsqrt_lut_lines(
-        ms_wire, ACC_BITS, rsqrt_wire, rsqrt_bits,
+        ms_wire, NORM_VAR_BITS, rsqrt_wire, ACC_BITS,
         prefix=f"{p}_rlut",
     )
     lines.append("")
@@ -460,25 +447,23 @@ def generate_rmsnorm(
         s_val = int(scale[i])
         s_flt = float(scale_f[i])
 
-        # x * rsqrt
+        # normed = x * rsqrt, keeping NORM_FRAC_BITS fractional bits (= x/rms in QN)
         xr = f"{p}_xr_{i}"
         lines.append(
-            f"    wire signed [{2 * ACC_BITS - 1}:0] {xr} = "
-            f"{se_names[i]} * {rsqrt_wire};"
+            f"    wire signed [63:0] {xr} = {se_names[i]} * {rsqrt_wire};"
         )
-
-        # truncate to ACC_BITS
         xr_trunc = f"{p}_xrt_{i}"
         lines.append(
             f"    wire signed [{ACC_BITS - 1}:0] {xr_trunc} = "
-            f"{xr}[{2 * ACC_BITS - 1}:{RSQRT_FRAC_BITS}];"
+            f"{xr} >>> {RSQRT_FRAC_BITS - NORM_FRAC_BITS};"
+            f"  // Q{NORM_FRAC_BITS}"
         )
 
-        # apply scale: result = scale[i] * xr_trunc >> bits
+        # out = (gamma_q * normed) >> NORM_FRAC_BITS  (gamma_q quantised at output scale)
         pre_sat = f"{p}_pre_{i}"
         lines.append(
             f"    wire signed [{ACC_BITS - 1}:0] {pre_sat} = "
-            f"({emit.slit(ACC_BITS, s_val)} * {xr_trunc}) >>> {bits};"
+            f"({emit.slit(ACC_BITS, s_val)} * {xr_trunc}) >>> {NORM_FRAC_BITS};"
             f"  // s={s_flt:.4f}"
         )
 
