@@ -8,11 +8,30 @@ Regression tests for graph-level audit fixes:
 import numpy as np
 import pytest
 
-from w2s.core import QuantConfig
+from w2s.core import QuantConfig, QuantScheme
 from w2s.importers.builder import GraphBuilder
 from w2s.quantize import quantize_graph
 from w2s.graph import compile_graph, _safe_ident
 from tests.rtl_harness import have_iverilog, simulate
+
+
+def test_asymmetric_quant_rejected_loudly():
+    """The hardware datapath is symmetric; asymmetric quant would silently drop
+    the zero-point, so quantize_graph must raise instead of miscomputing."""
+    g = _xor_graph_unquantized("asym")
+    g.quant_config = QuantConfig(bits=8, scheme=QuantScheme.ASYMMETRIC)
+    with pytest.raises(NotImplementedError, match="[Aa]symmetric"):
+        quantize_graph(g, {"x": np.random.randn(8, 2)})
+
+
+def _xor_graph_unquantized(name):
+    np.random.seed(0)
+    gb = GraphBuilder(name)
+    x = gb.input("x", shape=(2,))
+    h = gb.dense(x, np.random.randn(4, 2) * 0.5, np.zeros(4), activation="relu", name="h")
+    o = gb.dense(h, np.random.randn(1, 4) * 0.5, np.zeros(1), name="o")
+    gb.output(o)
+    return gb.build()
 
 
 def _xor_graph(name):

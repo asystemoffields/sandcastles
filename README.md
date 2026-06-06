@@ -62,6 +62,15 @@ Architecturally supports the building blocks used in modern LLMs (DeepSeek, Llam
 
 > **Note:** Sequential mode currently supports Dense, Conv1D, and Conv2D layers (with fused ReLU). Other operations use combinational logic.
 
+## Fidelity & known limitations
+
+The emitted hardware is verified against the integer golden model (`forward_int`) by RTL simulation (Icarus Verilog) for Dense, Conv, LayerNorm/RMSNorm and single-token attention. A few approximations are intentional and **not bit-exact to the original trained model** — know them before taping out:
+
+- **Attention uses ReLU-attention**, a softmax *approximation* (`relu(score)/Σ relu(score)`), not `softmax(QKᵀ/√d)`. Causal masking is supported (`attrs['causal']`, set automatically by the HuggingFace decoder importers). True exp-softmax is not yet implemented.
+- **RoPE** is applied at full embedding width on the pre-attention hidden state rather than per-head after the Q/K projections (the fused attention op does not expose Q/K); it is a positional-rotation approximation.
+- **`forward_int` models attention only at `seq_len == 1`** (multi-token golden vectors for attention are not yet generated).
+- Quantization is **symmetric only** (asymmetric is rejected, not silently mis-encoded). int4/int8/int16, per-tensor or per-channel.
+
 ## Quick start
 
 ```bash

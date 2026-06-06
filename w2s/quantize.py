@@ -61,6 +61,19 @@ def quantize_graph(
     scheme = config.scheme
     granularity = config.granularity
 
+    # The entire hardware datapath is symmetric (zero-point == 0): scales are
+    # stored as plain floats with no zero-point, and every generator and the
+    # requant math assume x_q = x_float * scale.  Asymmetric quantization bakes
+    # a zero-point into the integers that nothing downstream subtracts, so the
+    # dequantization is silently wrong.  Reject it loudly rather than emit a
+    # chip that computes the wrong values.
+    if scheme == QuantScheme.ASYMMETRIC:
+        raise NotImplementedError(
+            "Asymmetric quantization is not supported: the Verilog backend is "
+            "symmetric (zero-point 0) end-to-end and would silently drop the "
+            "zero-point.  Use QuantScheme.SYMMETRIC."
+        )
+
     # Step 1 -- calibrate: run float forward pass, collect tensor ranges
     tensor_ranges = calibrate(graph, calibration_data)
     graph.tensor_ranges = tensor_ranges
