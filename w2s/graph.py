@@ -17,6 +17,36 @@ from w2s.core import (
 from w2s import emit
 
 
+# Verilog-2005/SystemVerilog reserved words that must never be used as a module
+# identifier.  A graph named e.g. "xor" would otherwise emit `module xor (...)`,
+# which the synthesis/simulation tools parse as a gate primitive and reject.
+_VERILOG_KEYWORDS = frozenset("""
+and or not nand nor xor xnor buf bufif0 bufif1 notif0 notif1
+module endmodule input output inout wire reg integer real time realtime
+parameter localparam assign always initial begin end function endfunction
+task endtask generate endgenerate genvar for if else case endcase casex casez
+default while repeat forever posedge negedge signed unsigned
+supply0 supply1 tri triand trior wand wor pmos nmos cmos rcmos rpmos rnmos
+tran tranif0 tranif1 rtran event force release deassign disable fork join
+specify endspecify primitive endprimitive table endtable wait
+""".split())
+
+
+def _safe_ident(name: str) -> str:
+    """Sanitise a graph name into a legal, non-reserved Verilog identifier.
+
+    Keeps [A-Za-z0-9_$], replaces anything else with '_', ensures the name
+    starts with a letter/underscore, and prefixes reserved keywords so the
+    emitted module never collides with a Verilog primitive/keyword.
+    """
+    cleaned = "".join(c if (c.isalnum() or c in "_$") else "_" for c in str(name))
+    if not cleaned or not (cleaned[0].isalpha() or cleaned[0] == "_"):
+        cleaned = "m_" + cleaned
+    if cleaned in _VERILOG_KEYWORDS:
+        cleaned = cleaned + "_mod"
+    return cleaned
+
+
 # ---------------------------------------------------------------------------
 #  Generator dispatch
 # ---------------------------------------------------------------------------
@@ -207,13 +237,18 @@ def compile_graph(
                 out_ports.append((port_name, tw.bits))
                 output_assignments.append(f"    assign {port_name} = {wn};")
         else:
-            # Output tensor not found — add a placeholder
-            out_ports.append((f"out_{out_name}_0", bits))
-            output_assignments.append(
-                f"    assign out_{out_name}_0 = {bits}'sd0; // WARNING: tensor not found")
+            # An output tensor that no op produces must be a hard error: wiring
+            # it to a constant 0 (the old behaviour) emits a module that reports
+            # success while silently outputting zeros for that output.
+            produced = sorted(wire_map.keys())
+            raise ValueError(
+                f"Output tensor {out_name!r} is declared in graph.output_names "
+                f"but is not produced by any operation.  Producing tensors: "
+                f"{produced}.  Check the output name or the graph wiring."
+            )
 
     # --- Assemble module ---
-    lines.extend(emit.module_header(graph.name, in_ports, out_ports))
+    lines.extend(emit.module_header(_safe_ident(graph.name), in_ports, out_ports))
     lines.append("")
     lines.extend(op_lines)
     lines.extend(emit.section_comment("Outputs"))
@@ -255,9 +290,10 @@ def generate_testbench(
     bits = graph.quant_config.bits
     lines = []
 
+    mod_name = _safe_ident(graph.name)
     lines.append("`timescale 1ns / 1ps")
     lines.append("")
-    lines.append(f"module {graph.name}_tb;")
+    lines.append(f"module {mod_name}_tb;")
     lines.append("")
 
     # Declare signals
@@ -287,7 +323,7 @@ def generate_testbench(
     lines.append("")
 
     # DUT instantiation
-    lines.append(f"    {graph.name} dut (")
+    lines.append(f"    {mod_name} dut (")
     conns = []
     for wn in all_in_wires:
         conns.append(f"        .{wn}({wn})")

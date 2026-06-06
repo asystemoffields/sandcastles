@@ -36,9 +36,12 @@ def generate_dense(
     weight_f = op.weights['weight']                 # float, for comments
     bias_f = op.weights.get('bias', np.zeros(n_out, dtype=np.float64))  # float, for comments
 
-    requant_mult = op.q_params['requant_mult']      # int or ndarray
-    requant_shift = op.q_params['requant_shift']     # int
-    acc_bits = op.q_params['acc_bits']               # int
+    # Default to identity requant (mult=1, shift=0) when unspecified, matching
+    # forward_int and the sequential compiler, so the three execution paths
+    # never silently disagree on a hand-built / partially-quantized graph.
+    requant_mult = op.q_params.get('requant_mult', 1)   # int or ndarray
+    requant_shift = op.q_params.get('requant_shift', 0)  # int
+    acc_bits = op.q_params.get('acc_bits', emit.acc_bits_for(n_in, bits))
     activation = op.attrs.get('activation', 'none')
 
     per_channel = isinstance(requant_mult, np.ndarray)

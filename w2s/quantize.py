@@ -1243,16 +1243,24 @@ def _compute_embedding_requant(
     output_name = op.outputs[0]
     output_scale = tensor_scales.get(output_name, 1.0)
 
+    # Quantise the table directly in the OUTPUT scale, so the looked-up value is
+    # already in the scale downstream layers expect (identity requant).  The old
+    # code quantised at the table's own abs-max and emitted identity requant, so
+    # the embedding output was misread by output_scale/weight_scale whenever the
+    # calibrated output scale differed from the table's abs-max scale.
     weight = op.weights['weight']                   # (V, D)
-    q_arr, ws = quantize_tensor(weight, bits, scheme, granularity, axis=0)
+    qmax = (1 << (bits - 1)) - 1
+    q_arr = np.clip(
+        np.round(np.asarray(weight, dtype=np.float64) * output_scale),
+        -qmax, qmax,
+    ).astype(np.int64)
     op.q_weights['weight'] = q_arr
-    ws_float = float(ws[0]) if ws.size == 1 else ws
 
     op.q_params = {
         'requant_mult': 1,
         'requant_shift': 0,
         'input_scale': 1.0,                         # no input scale for embeddings
-        'weight_scale': ws_float,
+        'weight_scale': float(output_scale),        # table stored in output scale
         'output_scale': float(output_scale),
         'acc_bits': bits,
     }
