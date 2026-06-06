@@ -197,13 +197,23 @@ def _count_multipliers_sparse(op: Operation, weights: Dict) -> int:
 #  Structured sparsity detection
 # ---------------------------------------------------------------------------
 
-def detect_structured_2_4(weights: np.ndarray, threshold: float = 0.9) -> bool:
+def detect_structured_2_4(weights: np.ndarray, threshold: float = 0.99) -> bool:
     """
-    Check if a weight matrix has 2:4 structured sparsity.
+    Check if a weight matrix actually has 2:4 structured sparsity.
 
-    In 2:4 sparsity, for every group of 4 consecutive elements along the
-    last axis, at most 2 are non-zero.  Returns True if at least
-    `threshold` fraction of groups satisfy this pattern.
+    In 2:4 sparsity, every group of 4 consecutive elements along the last
+    axis keeps *exactly* the top-2 (so at most 2 are non-zero) and the
+    realized density sits at ~50%.  A loose "at least 90% of groups have
+    <=2 non-zeros" test wrongly flags plain *unstructured* high sparsity
+    (e.g. a 70% sparse random matrix trivially has <=2 non-zeros in almost
+    every group of 4, yet is not 2:4 structured at all).
+
+    To avoid that mislabeling we require BOTH:
+      1. (nearly) ALL groups comply with the <=2 budget
+         (fraction >= ``threshold``, default 0.99), and
+      2. a majority of groups actually *use* the budget, i.e. have exactly
+         2 non-zeros — this is the fingerprint of top-2 pruning and is what
+         separates true 2:4 from a matrix that is merely very sparse.
     """
     if weights.ndim < 2:
         return False
@@ -216,7 +226,8 @@ def detect_structured_2_4(weights: np.ndarray, threshold: float = 0.9) -> bool:
 
     # Check groups of 4 along columns
     n_groups = cols // 4
-    compliant = 0
+    compliant = 0   # groups with <= 2 non-zeros
+    exactly_2 = 0   # groups with exactly 2 non-zeros
     total = 0
 
     for row in flat:
@@ -226,8 +237,13 @@ def detect_structured_2_4(weights: np.ndarray, threshold: float = 0.9) -> bool:
             total += 1
             if nnz <= 2:
                 compliant += 1
+            if nnz == 2:
+                exactly_2 += 1
 
-    return total > 0 and (compliant / total) >= threshold
+    if total == 0:
+        return False
+
+    return (compliant / total) >= threshold and (exactly_2 / total) >= 0.5
 
 
 def detect_structured_nm(
@@ -315,39 +331,20 @@ def prune_weights(
 
 
 def _prune_to_target(graph: ComputeGraph, target: float) -> ComputeGraph:
-    """Prune globally to reach a target sparsity level."""
-    # Collect all weight values
-    all_weights = []
-    locations = []  # (op_idx, key, flat_idx)
+    """
+    Prune globally to reach a target sparsity level.
 
-    for i, op in enumerate(graph.operations):
-        if not op.q_weights:
-            continue
-        for key in _get_weight_keys(op):
-            if key not in op.q_weights:
-                continue
-            w = op.q_weights[key]
-            flat = w.flatten()
-            for j, v in enumerate(flat):
-                all_weights.append(abs(int(v)))
-                locations.append((i, key, w.shape, j))
+    Selects EXACTLY ``n_to_prune`` weights — the n smallest by absolute
+    magnitude — and zeros them.  A naive ``|w| <= threshold`` mask massively
+    overshoots the target on quantized integer weights, where many values
+    tie at the threshold magnitude.  Here we rank all weights and zero the
+    first n, breaking ties deterministically by global (stable) order.
+    """
+    # Collect all (already non-zero) weight magnitudes with their locations.
+    abs_vals: List[int] = []
+    # locations: (weight_array, flat_index_within_array)
+    locations: List[Tuple[np.ndarray, int]] = []
 
-    if not all_weights:
-        return graph
-
-    all_weights = np.array(all_weights)
-    n_to_prune = int(len(all_weights) * target)
-
-    # Find threshold: the n_to_prune-th smallest absolute value
-    if n_to_prune >= len(all_weights):
-        prune_thresh = np.max(all_weights) + 1
-    elif n_to_prune <= 0:
-        return graph
-    else:
-        sorted_abs = np.sort(all_weights)
-        prune_thresh = sorted_abs[n_to_prune - 1]
-
-    # Apply pruning
     for op in graph.operations:
         if not op.q_weights:
             continue
@@ -355,8 +352,33 @@ def _prune_to_target(graph: ComputeGraph, target: float) -> ComputeGraph:
             if key not in op.q_weights:
                 continue
             w = op.q_weights[key]
-            mask = np.abs(w) <= prune_thresh
-            op.q_weights[key] = np.where(mask, 0, w)
+            flat = w.reshape(-1)
+            for j in range(flat.size):
+                abs_vals.append(abs(int(flat[j])))
+                locations.append((w, j))
+
+    if not abs_vals:
+        return graph
+
+    abs_arr = np.asarray(abs_vals)
+    n_total = abs_arr.size
+    n_to_prune = int(n_total * target)
+
+    if n_to_prune <= 0:
+        return graph
+    if n_to_prune > n_total:
+        n_to_prune = n_total
+
+    # Stable argsort over magnitudes: ties are broken by ascending global
+    # index, so the choice of which tied weights to prune is deterministic.
+    order = np.argsort(abs_arr, kind="stable")
+    to_prune = order[:n_to_prune]
+
+    for idx in to_prune:
+        w, j = locations[idx]
+        # .flat assignment writes back to the original array regardless of
+        # memory layout (reshape/ravel may return a copy).
+        w.flat[j] = 0
 
     return graph
 

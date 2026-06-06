@@ -352,6 +352,7 @@ class GraphBuilder:
         num_heads: int,
         seq_len: int = 1,
         name: str = None,
+        causal: bool = False,
     ) -> str:
         op_name = self._auto_name("mha", name)
         qw = np.asarray(q_weight)
@@ -366,6 +367,7 @@ class GraphBuilder:
                 "head_dim": head_dim,
                 "embed_dim": embed_dim,
                 "seq_len": seq_len,
+                "causal": bool(causal),
             },
             weights={
                 "q_weight": qw,
@@ -388,7 +390,7 @@ class GraphBuilder:
         q_weight, q_bias, k_weight, k_bias,
         v_weight, v_bias, out_weight, out_bias,
         num_heads: int, num_kv_heads: int,
-        seq_len: int = 1, name: str = None,
+        seq_len: int = 1, name: str = None, causal: bool = False,
     ) -> str:
         """Grouped-query attention (fewer K/V heads than Q heads)."""
         op_name = self._auto_name("gqa", name)
@@ -399,7 +401,7 @@ class GraphBuilder:
             OpType.GROUPED_QUERY_ATTENTION, op_name, [input],
             attrs={"num_heads": num_heads, "num_kv_heads": num_kv_heads,
                    "head_dim": head_dim, "embed_dim": embed_dim,
-                   "seq_len": seq_len},
+                   "seq_len": seq_len, "causal": bool(causal)},
             weights={"q_weight": qw, "q_bias": np.asarray(q_bias),
                      "k_weight": np.asarray(k_weight),
                      "k_bias": np.asarray(k_bias),

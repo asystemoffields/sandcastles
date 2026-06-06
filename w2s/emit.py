@@ -74,6 +74,25 @@ def mac_term(weight_val: int, input_wire: str, acc_bits: int = 32,
     return f"({slit(acc_bits, weight_val)} * {input_wire}){cmt}"
 
 
+def requant_prod_bits(acc_bits: int, mult: int) -> int:
+    """
+    Width of the requantization product wire.
+
+    Sized to hold acc_bits-wide * mult-wide signed product without
+    truncating MSBs.  ``compute_requant`` caps the multiplier at 32-bit, so
+    assuming a fixed 16-bit multiplier (the old ``acc_bits + 18``) silently
+    dropped the top bits whenever a >16-bit multiplier met a wide
+    accumulator.  We size to the *actual* multiplier bit width instead.
+
+    The product of an a-bit and a b-bit signed number needs a+b bits; we add
+    a 2-bit margin (covers the round-to-nearest +half carry) and cap at 64.
+    """
+    mult_bits = int(abs(int(mult))).bit_length() + 1   # magnitude + sign bit
+    if mult_bits < 2:
+        mult_bits = 2
+    return min(acc_bits + mult_bits + 2, 64)
+
+
 def requantize_lines(
     acc_name: str,
     acc_bits: int,
@@ -82,15 +101,19 @@ def requantize_lines(
     prefix: str,
 ) -> Tuple[List[str], str]:
     """
-    Generate the requantization multiply + shift.
+    Generate the requantization multiply + (rounding) shift.
 
-    The intermediate width is sized to fit the product (acc * 16-bit mult)
-    plus a small safety margin, instead of always using 64 bits.  This lets
-    synthesis tools use narrower multipliers where possible.
+    The intermediate width is sized via :func:`requant_prod_bits` to fit the
+    full acc * mult product (the multiplier may be up to 32-bit), so the
+    multiply never truncates MSBs.
+
+    The shift rounds to nearest (adds half an LSB before the arithmetic
+    right-shift) instead of truncating toward -inf, which otherwise injects a
+    ~-0.5 LSB bias on every requantized layer.
 
     Returns (verilog_lines, shifted_wire_name).
     """
-    prod_bits = min(acc_bits + 18, 64)  # acc * 16-bit mult + margin
+    prod_bits = requant_prod_bits(acc_bits, mult)
 
     ext = f"{prefix}_ext"
     prod = f"{prefix}_rprod"
@@ -98,9 +121,45 @@ def requantize_lines(
     lines = [
         sign_extend_wire(acc_name, acc_bits, ext, prod_bits),
         f"    wire signed [{prod_bits - 1}:0] {prod} = {ext} * {slit(prod_bits, mult)};",
-        f"    wire signed [{prod_bits - 1}:0] {shifted} = {prod} >>> {shift};",
     ]
+    if shift > 0:
+        # Round to nearest: add half an LSB before the arithmetic shift.
+        half = 1 << (shift - 1)
+        lines.append(
+            f"    wire signed [{prod_bits - 1}:0] {shifted} = "
+            f"({prod} + {slit(prod_bits, half)}) >>> {shift};"
+        )
+    else:
+        lines.append(
+            f"    wire signed [{prod_bits - 1}:0] {shifted} = {prod} >>> {shift};"
+        )
     return lines, shifted
+
+
+def compute_rescale(in_scale: float, out_scale: float,
+                    shift: int = 16) -> Tuple[int, int]:
+    """
+    Integer (multiplier, shift) approximating ``out_scale / in_scale``.
+
+    Used to align a fixed-point operand from its own scale to a common
+    (output) scale before structural ops combine raw integers:
+        out_q ≈ (in_q * mult) >> shift   with   mult / 2**shift ≈ out/in.
+
+    Mirrors :func:`w2s.quantize.compute_requant` (weight_scale == 1) but lives
+    here so the structural generators stay free of a circular import.
+    """
+    if in_scale < 1e-30:
+        in_scale = 1e-30
+    if out_scale < 1e-30:
+        out_scale = 1e-30
+    ratio = out_scale / in_scale
+    for s in range(shift, max(shift - 16, 0), -1):
+        M = round(ratio * (1 << s))
+        if abs(M) <= 0x7FFFFFFF:
+            return int(M), int(s)
+    M = round(ratio * (1 << shift))
+    M = max(-0x7FFFFFFF, min(0x7FFFFFFF, M))
+    return int(M), int(shift)
 
 
 def saturate_relu(src_name: str, src_bits: int,

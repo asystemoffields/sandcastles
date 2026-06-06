@@ -169,6 +169,7 @@ def autofit(
     prefer_combinational: bool = False,
     max_sparsity: float = 0.75,
     sparsity_steps: List[float] = None,
+    fpga_device=None,
 ) -> FitResult:
     """
     Automatically find the best configuration to fit a model on a device.
@@ -180,6 +181,10 @@ def autofit(
         prefer_combinational:  Try combinational mode before sequential.
         max_sparsity:          Maximum sparsity level to try (0.0-1.0).
         sparsity_steps:        Sparsity levels to try (default: [0.25, 0.5, 0.75]).
+        fpga_device:           Optional FPGADevice.  When given, the fit
+                               decision uses the FPGA estimator (which models
+                               BRAM-resident weights) instead of the Tiny
+                               Tapeout ASIC estimator.
 
     Returns:
         A FitResult describing the best configuration found.
@@ -193,7 +198,8 @@ def autofit(
 
     # Strategy 1: Try uniform int8
     for mode in modes:
-        result = _try_config(graph, calibration_data, 8, None, 0.0, mode, device_luts)
+        result = _try_config(graph, calibration_data, 8, None, 0.0, mode,
+                             device_luts, fpga_device)
         if result.fits:
             return result
 
@@ -206,13 +212,14 @@ def autofit(
         for layer in ranked:
             bits_map[layer.name] = 4
             result = _try_config(graph, calibration_data, 8, dict(bits_map),
-                                 0.0, mode, device_luts)
+                                 0.0, mode, device_luts, fpga_device)
             if result.fits:
                 return result
 
     # Strategy 3: All int4
     for mode in modes:
-        result = _try_config(graph, calibration_data, 4, None, 0.0, mode, device_luts)
+        result = _try_config(graph, calibration_data, 4, None, 0.0, mode,
+                             device_luts, fpga_device)
         if result.fits:
             return result
 
@@ -221,13 +228,13 @@ def autofit(
         for mode in modes:
             # int4 + sparsity
             result = _try_config(graph, calibration_data, 4, None,
-                                 sparsity, mode, device_luts)
+                                 sparsity, mode, device_luts, fpga_device)
             if result.fits:
                 return result
 
             # int8 + sparsity (better accuracy than int4)
             result = _try_config(graph, calibration_data, 8, None,
-                                 sparsity, mode, device_luts)
+                                 sparsity, mode, device_luts, fpga_device)
             if result.fits:
                 return result
 
@@ -260,10 +267,15 @@ def autofit_fpga(
     if device is None:
         from w2s.fpga import ICE40_UP5K
         device = ICE40_UP5K
+    # Pass the FPGADevice so the fit decision uses estimate_fpga (which models
+    # BRAM-resident weights) rather than the Tiny Tapeout ASIC estimator, whose
+    # sequential path stuffs the whole weight ROM into LUT fabric and would
+    # wrongly declare BRAM-resident models "too large".
     return autofit(
         graph, calibration_data, device.lut4s,
         prefer_combinational=prefer_combinational,
         max_sparsity=max_sparsity,
+        fpga_device=device,
     )
 
 
@@ -279,8 +291,15 @@ def _try_config(
     sparsity: float,
     mode: str,
     device_luts: int,
+    fpga_device=None,
 ) -> FitResult:
-    """Try a specific configuration and estimate area."""
+    """Try a specific configuration and estimate area.
+
+    If ``fpga_device`` is given, the fit decision uses the FPGA estimator
+    (estimate_fpga), which models BRAM-resident weights and checks both logic
+    LUTs vs device.lut4s AND weight ROM bits vs the device's BRAM capacity.
+    Otherwise the Tiny Tapeout ASIC estimator is used against ``device_luts``.
+    """
     config = QuantConfig(bits=bits, scheme=QuantScheme.SYMMETRIC)
 
     # Deep copy to avoid mutating the original
@@ -294,9 +313,18 @@ def _try_config(
         prune_weights(g, target_sparsity=sparsity)
 
     # Estimate
-    report = estimate_asic(g, mode=mode)
-
-    fits = report.estimated_luts <= device_luts
+    if fpga_device is not None:
+        from w2s.fpga import estimate_fpga
+        fpga_report = estimate_fpga(g, fpga_device, mode=mode)
+        # FPGAEstimate.fits already checks logic LUTs vs lut4s AND (uncapped)
+        # weight ROM bits vs BRAM capacity AND DSP usage.
+        estimated_luts = fpga_report.lut4s_used
+        fits = fpga_report.fits
+        device_luts = fpga_device.lut4s
+    else:
+        report = estimate_asic(g, mode=mode)
+        estimated_luts = report.estimated_luts
+        fits = estimated_luts <= device_luts
 
     # Build config summary
     parts = [f"int{bits}"]
@@ -317,7 +345,7 @@ def _try_config(
         bits=bits,
         bits_map=bits_map if bits_map else None,
         sparsity=sparsity,
-        estimated_luts=report.estimated_luts,
+        estimated_luts=estimated_luts,
         device_luts=device_luts,
         n_layers_downgraded=n_downgraded,
         config_summary=config_summary,

@@ -224,25 +224,45 @@ def generate_serial_wrapper(
     e(f"        end else begin")
     e(f"            case (state)")
     e()
-    e(f"                IDLE: begin")
-    e(f"                    done      <= 0;")
-    e(f"                    out_valid <= 0;")
-    e(f"                    if (data_valid) begin")
-    e(f"                        in_buf[0] <= data_in;")
-    e(f"                        in_count <= 1;")
-    e(f"                        state    <= LOADING;")
-    e(f"                    end")
-    e(f"                end")
-    e()
-    e(f"                LOADING: begin")
-    e(f"                    if (data_valid) begin")
-    e(f"                        in_buf[in_count] <= data_in;")
-    e(f"                        if (in_count == {addr_bits_in + 1}'d{n_in - 1}) begin")
-    e(f"                            state <= COMPUTE;")
-    e(f"                        end")
-    e(f"                        in_count <= in_count + 1;")
-    e(f"                    end")
-    e(f"                end")
+    if n_in == 1:
+        # Single-input edge case: the one and only value is captured in IDLE,
+        # so we transition straight to COMPUTE. Routing through LOADING would
+        # deadlock (it would wait for a second data_valid that never makes
+        # in_count == n_in-1 == 0, and would write in_buf[1] out of bounds).
+        e(f"                IDLE: begin")
+        e(f"                    done      <= 0;")
+        e(f"                    out_valid <= 0;")
+        e(f"                    if (data_valid) begin")
+        e(f"                        in_buf[0] <= data_in;")
+        e(f"                        in_count  <= 0;")
+        e(f"                        state     <= COMPUTE;")
+        e(f"                    end")
+        e(f"                end")
+        e()
+        e(f"                LOADING: begin")
+        e(f"                    // Unreachable for single-input designs.")
+        e(f"                    state <= COMPUTE;")
+        e(f"                end")
+    else:
+        e(f"                IDLE: begin")
+        e(f"                    done      <= 0;")
+        e(f"                    out_valid <= 0;")
+        e(f"                    if (data_valid) begin")
+        e(f"                        in_buf[0] <= data_in;")
+        e(f"                        in_count <= 1;")
+        e(f"                        state    <= LOADING;")
+        e(f"                    end")
+        e(f"                end")
+        e()
+        e(f"                LOADING: begin")
+        e(f"                    if (data_valid) begin")
+        e(f"                        in_buf[in_count] <= data_in;")
+        e(f"                        if (in_count == {addr_bits_in + 1}'d{n_in - 1}) begin")
+        e(f"                            state <= COMPUTE;")
+        e(f"                        end")
+        e(f"                        in_count <= in_count + 1;")
+        e(f"                    end")
+        e(f"                end")
     e()
     e(f"                COMPUTE: begin")
     e(f"                    // Core is combinational — result is ready instantly")
@@ -301,6 +321,21 @@ def generate_tiny_tapeout_wrapper(
     out.mkdir(parents=True, exist_ok=True)
     bits = graph.quant_config.bits
     name = f"tt_um_{graph.name}"
+
+    # The Tiny Tapeout dedicated I/O is exactly 8 pins wide (ui_in[7:0] /
+    # uo_out[7:0]).  The serial wrapper is parameterized on `bits`, so for
+    # bits > 8 the high input bits would be left unconnected and the high
+    # output bits silently dropped — corrupting every value.  Multi-cycle
+    # byte-serialized I/O for bits > 8 is not implemented; refuse to emit a
+    # silently-truncating wrapper instead.
+    if bits > 8:
+        raise ValueError(
+            f"generate_tiny_tapeout_wrapper: bits={bits} does not fit the "
+            f"8-pin Tiny Tapeout ui_in/uo_out interface. The 8-bit pins "
+            f"would silently truncate {bits}-bit values. Use bits<=8 for "
+            f"Tiny Tapeout, or a wrapper with byte-serialized multi-cycle "
+            f"I/O (not yet implemented)."
+        )
 
     L: List[str] = []
 

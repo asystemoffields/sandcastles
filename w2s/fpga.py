@@ -20,6 +20,22 @@ import numpy as np
 from w2s.core import ComputeGraph, Operation, OpType
 
 
+def _matmul_weight_keys(op: Operation):
+    """Weight tensor keys whose matrices feed a matmul (i.e. contribute
+    multipliers).  Mirrors estimate._weight_keys_for_op so the FPGA estimator
+    counts the same tensors as the Tiny Tapeout estimator -- but deliberately
+    EXCLUDES EMBEDDING (a ROM lookup, not a multiply) and normalization scale
+    vectors (element-wise, no matmul)."""
+    if op.op_type in (OpType.DENSE, OpType.CONV1D, OpType.CONV2D):
+        return ('weight',)
+    if op.op_type in (OpType.MULTI_HEAD_ATTENTION,
+                      OpType.GROUPED_QUERY_ATTENTION):
+        return ('q_weight', 'k_weight', 'v_weight', 'out_weight')
+    if op.op_type == OpType.SWIGLU:
+        return ('gate_weight', 'up_weight', 'down_weight')
+    return ()
+
+
 # ---------------------------------------------------------------------------
 #  FPGA device definitions
 # ---------------------------------------------------------------------------
@@ -168,8 +184,11 @@ def estimate_fpga(
         weights = op.q_weights if op.q_weights else op.weights
         for w in weights.values():
             total_params += int(np.prod(w.shape))
-        if op.op_type in (OpType.DENSE, OpType.CONV1D, OpType.CONV2D):
-            w = weights.get('weight')
+        # Count nonzeros of EVERY weight matrix that participates in a matmul:
+        # dense/conv 'weight', the four attention projections, and the three
+        # SwiGLU projections.  Embedding stays a ROM (params only, no mults).
+        for key in _matmul_weight_keys(op):
+            w = weights.get(key)
             if w is not None:
                 total_multiplies += int(np.count_nonzero(w))
 
@@ -205,9 +224,10 @@ def _estimate_fpga_sequential(graph, device, ops, total_params,
     max_buf = 0
     for op in ops:
         weights = op.q_weights if op.q_weights else op.weights
-        w = weights.get('weight')
-        if w is not None:
-            max_buf = max(max_buf, w.shape[0])
+        for key in _matmul_weight_keys(op):
+            w = weights.get(key)
+            if w is not None:
+                max_buf = max(max_buf, w.shape[0])
     buffer_ffs = max_buf * bits + 80  # activation buffer + state regs
 
     lut4s_used = mac_luts + control_luts
@@ -257,10 +277,13 @@ def _estimate_fpga_combinational(graph, device, ops, total_params,
     n_neurons = 0
     for op in ops:
         weights = op.q_weights if op.q_weights else op.weights
-        w = weights.get('weight')
-        if w is not None:
-            n_neurons += w.shape[0]
-            add_luts += max(int(np.count_nonzero(w)) - w.shape[0], 0) * luts_per_add
+        # Every matmul weight matrix has shape[0] output accumulators that each
+        # need requant + saturation, and (nonzeros - rows) summing adders.
+        for key in _matmul_weight_keys(op):
+            w = weights.get(key)
+            if w is not None:
+                n_neurons += w.shape[0]
+                add_luts += max(int(np.count_nonzero(w)) - w.shape[0], 0) * luts_per_add
 
     requant_luts = n_neurons * 64
     sat_luts = n_neurons * 8

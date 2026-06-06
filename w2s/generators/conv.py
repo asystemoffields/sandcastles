@@ -16,11 +16,23 @@ from w2s.emit import (
     sign_extend_wire,
     mac_term,
     requantize_lines,
+    requant_prod_bits,
     saturate,
     section_comment,
     wire_signed,
     slit,
 )
+
+
+def _as_pair(val, default):
+    """Normalize an attr that may be int, 1-/2-tuple, or None to a 2-tuple."""
+    if val is None:
+        return default
+    if isinstance(val, (tuple, list)):
+        if len(val) == 1:
+            return (val[0], val[0])
+        return (val[0], val[1])
+    return (val, val)
 
 
 # ---------------------------------------------------------------------------
@@ -52,6 +64,12 @@ def generate_conv2d(
     kernel_size = op.attrs.get('kernel_size', (kH, kW))
     sH, sW = op.attrs.get('stride', (1, 1))
     pH, pW = op.attrs.get('padding', (0, 0))
+    dH, dW = _as_pair(op.attrs.get('dilation'), (1, 1))
+
+    # Dilation spreads the kernel taps apart: the effective receptive field is
+    # (kH-1)*dH + 1 tall.  Tap r samples the input at offset r*dH (not r).
+    kH_eff = (kH - 1) * dH + 1
+    kW_eff = (kW - 1) * dW + 1
 
     requant_mult = op.q_params['requant_mult']              # ndarray (Co,) or scalar
     requant_shift = op.q_params['requant_shift']             # int (shared across all channels)
@@ -84,8 +102,8 @@ def generate_conv2d(
         )
 
     # ---- output geometry -----------------------------------------------
-    H_out = (H_in + 2 * pH - kH) // sH + 1
-    W_out = (W_in + 2 * pW - kW) // sW + 1
+    H_out = (H_in + 2 * pH - kH_eff) // sH + 1
+    W_out = (W_in + 2 * pW - kW_eff) // sW + 1
 
     out_name = op.outputs[0]
     n_out = C_out * H_out * W_out
@@ -99,7 +117,7 @@ def generate_conv2d(
     requant_shift_val = int(requant_shift)
     lines += section_comment(
         f"{op.name}: Conv2D  in({C_in},{H_in},{W_in}) "
-        f"k({kH},{kW}) s({sH},{sW}) p({pH},{pW}) -> "
+        f"k({kH},{kW}) s({sH},{sW}) p({pH},{pW}) d({dH},{dW}) -> "
         f"out({C_out},{H_out},{W_out})"
     )
     lines.append(
@@ -129,8 +147,8 @@ def generate_conv2d(
                 for ci in range(C_in):
                     for r in range(kH):
                         for s in range(kW):
-                            ih = oh * sH - pH + r
-                            iw = ow * sW - pW + s
+                            ih = oh * sH - pH + r * dH
+                            iw = ow * sW - pW + s * dW
                             # skip out-of-bounds (zero-padded)
                             if ih < 0 or ih >= H_in or iw < 0 or iw >= W_in:
                                 continue
@@ -155,8 +173,8 @@ def generate_conv2d(
                 for ci in range(C_in):
                     for r in range(kH):
                         for s in range(kW):
-                            ih = oh * sH - pH + r
-                            iw = ow * sW - pW + s
+                            ih = oh * sH - pH + r * dH
+                            iw = ow * sW - pW + s * dW
                             if ih < 0 or ih >= H_in or iw < 0 or iw >= W_in:
                                 continue
                             wval = int(weight[co, ci, r, s])
@@ -216,7 +234,7 @@ def generate_conv2d(
 
                 # 4) saturate + optional activation
                 out_wire = out_wire_names[flat_idx]
-                prod_bits = min(acc_bits + 18, 64)
+                prod_bits = requant_prod_bits(acc_bits, mult_co)
                 lines += saturate(shifted, prod_bits, out_wire, bits, activation)
                 lines.append("")
 
@@ -263,6 +281,12 @@ def generate_conv1d(
     pW = op.attrs.get('padding', (0,))
     if isinstance(pW, (tuple, list)):
         pW = pW[0]
+    dW = op.attrs.get('dilation', (1,))
+    if isinstance(dW, (tuple, list)):
+        dW = dW[0]
+
+    # Dilation spreads kernel taps apart: tap s samples the input at s*dW.
+    kW_eff = (kW - 1) * dW + 1
 
     requant_mult = op.q_params['requant_mult']              # ndarray (Co,) or scalar
     requant_shift = op.q_params['requant_shift']             # int (shared across all channels)
@@ -292,7 +316,7 @@ def generate_conv1d(
         )
 
     # ---- output geometry -----------------------------------------------
-    W_out = (W_in + 2 * pW - kW) // sW + 1
+    W_out = (W_in + 2 * pW - kW_eff) // sW + 1
 
     out_name = op.outputs[0]
     n_out = C_out * W_out
@@ -306,7 +330,7 @@ def generate_conv1d(
     requant_shift_val = int(requant_shift)
     lines += section_comment(
         f"{op.name}: Conv1D  in({C_in},{W_in}) "
-        f"k({kW}) s({sW}) p({pW}) -> out({C_out},{W_out})"
+        f"k({kW}) s({sW}) p({pW}) d({dW}) -> out({C_out},{W_out})"
     )
     lines.append(
         f"    // {n_weights} weights + {n_biases} biases hardwired"
@@ -333,7 +357,7 @@ def generate_conv1d(
             ext_map: Dict[Tuple[int, int], str] = {}
             for ci in range(C_in):
                 for s in range(kW):
-                    iw = ow * sW - pW + s
+                    iw = ow * sW - pW + s * dW
                     if iw < 0 or iw >= W_in:
                         continue
                     wval = int(weight[co, ci, s])
@@ -356,7 +380,7 @@ def generate_conv1d(
             terms: List[str] = []
             for ci in range(C_in):
                 for s in range(kW):
-                    iw = ow * sW - pW + s
+                    iw = ow * sW - pW + s * dW
                     if iw < 0 or iw >= W_in:
                         continue
                     wval = int(weight[co, ci, s])
@@ -415,7 +439,7 @@ def generate_conv1d(
 
             # 4) saturate + optional activation
             out_wire = out_wire_names[flat_idx]
-            prod_bits = min(acc_bits + 18, 64)
+            prod_bits = requant_prod_bits(acc_bits, mult_co)
             lines += saturate(shifted, prod_bits, out_wire, bits, activation)
             lines.append("")
 

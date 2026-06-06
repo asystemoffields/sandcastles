@@ -99,6 +99,79 @@ def _compute_layers(ops: List[Operation]) -> List[Operation]:
 
 
 # ---------------------------------------------------------------------------
+#  Topology guard: the sequential dataflow is a hardwired linear chain
+#  buf0(input) -> buf1(layer0) -> buf2(layer1) -> ... -> buf{n}(output).
+#  That wiring is only correct if the *actual* op graph really is a single
+#  linear chain (each op consumes exactly the previous op's output; the
+#  first op consumes the graph input; the last op produces the single graph
+#  output).  Branches, skip/residual connections, multiple graph inputs and
+#  multiple graph outputs all violate the assumption — the compiler would
+#  otherwise silently emit Verilog for a *different* network.  We reject them
+#  here instead.
+# ---------------------------------------------------------------------------
+
+def _assert_linear_chain(ops: List[Operation], graph: ComputeGraph) -> None:
+    """
+    Verify that ``ops`` (the fused op stream, in topological order) forms a
+    single linear chain consistent with the buf0->buf1->...->bufN wiring.
+
+    Raises NotImplementedError (naming the offending op) on any branch,
+    skip/residual edge, multi-input or multi-output topology.
+    """
+    if len(graph.input_names) != 1:
+        raise NotImplementedError(
+            f"Sequential compile requires exactly one graph input "
+            f"(buf0 is a single input stream); graph {graph.name!r} has "
+            f"{len(graph.input_names)} inputs: {graph.input_names}.  "
+            f"Use --mode combinational for multi-input graphs."
+        )
+    if len(graph.output_names) != 1:
+        raise NotImplementedError(
+            f"Sequential compile requires exactly one graph output (it "
+            f"streams a single buffer); graph {graph.name!r} has "
+            f"{len(graph.output_names)} outputs: {graph.output_names}.  "
+            f"Use --mode combinational for multi-output graphs."
+        )
+
+    graph_in = graph.input_names[0]
+    graph_out = graph.output_names[0]
+
+    prev_out = graph_in
+    for op in ops:
+        if len(op.inputs) != 1:
+            raise NotImplementedError(
+                f"Sequential compile only supports a single linear chain, "
+                f"but op {op.name!r} ({op.op_type.value}) has "
+                f"{len(op.inputs)} inputs {op.inputs} (a merge/residual "
+                f"join).  Use --mode combinational."
+            )
+        if op.inputs[0] != prev_out:
+            raise NotImplementedError(
+                f"Sequential compile only supports a single linear chain "
+                f"(buf0->buf1->...), but op {op.name!r} ({op.op_type.value}) "
+                f"consumes tensor {op.inputs[0]!r} instead of the previous "
+                f"op's output {prev_out!r}.  This indicates a branch / "
+                f"skip connection / parallel layer.  Use --mode combinational."
+            )
+        if len(op.outputs) != 1:
+            raise NotImplementedError(
+                f"Sequential compile only supports a single linear chain, "
+                f"but op {op.name!r} ({op.op_type.value}) produces "
+                f"{len(op.outputs)} outputs {op.outputs}.  "
+                f"Use --mode combinational."
+            )
+        prev_out = op.outputs[0]
+
+    if prev_out != graph_out:
+        raise NotImplementedError(
+            f"Sequential compile expects the last op to produce the single "
+            f"graph output {graph_out!r}, but the chain ends at {prev_out!r}.  "
+            f"The graph output is not the tail of a linear chain (dangling / "
+            f"branched topology).  Use --mode combinational."
+        )
+
+
+# ---------------------------------------------------------------------------
 #  Weight / bias ROM generation
 # ---------------------------------------------------------------------------
 
@@ -231,6 +304,12 @@ def compile_sequential(
 
     # Fuse and sort ops
     ops = _fuse_ops(graph.topological_order())
+
+    # Topology guard: the buf0->buf1->...->bufN wiring below is only correct
+    # for a single linear chain.  Reject branches/residuals/multi-output
+    # rather than silently miscompiling them.
+    _assert_linear_chain(ops, graph)
+
     layers = _compute_layers(ops)
 
     if not layers:
@@ -265,6 +344,21 @@ def compile_sequential(
 
     n_output = buf_sizes[-1]
     n_layers = len(layers)
+
+    # ----- Accumulator / bias width -----
+    # A single int{bits} product is ~2^(2*bits-1); summing fan-in of them
+    # needs 2*bits + ceil(log2(fan_in)) + margin bits.  Hardcoding 32 bits
+    # silently overflows for int16 with fan-in >= 2 (a single product is
+    # already ~2^30).  Size the accumulator (and the bias ROM that feeds it)
+    # from the widest per-layer requirement, honouring the quantizer's own
+    # q_params['acc_bits'] when present and falling back to emit.acc_bits_for.
+    acc_bits = 32  # sensible minimum (keeps int8 designs identical)
+    for layer in layers:
+        n_in_l = layer.q_weights['weight'].shape[1]
+        layer_acc = layer.q_params.get('acc_bits')
+        if layer_acc is None:
+            layer_acc = emit.acc_bits_for(n_in_l, bits)
+        acc_bits = max(acc_bits, int(layer_acc))
 
     # Compute address widths
     def aw(size):
@@ -380,18 +474,18 @@ def compile_sequential(
         L.extend(_weight_rom_lines(f"l{i}", w, bits, hex_dir=out))
         b = layer.q_weights.get('bias')
         if b is not None:
-            L.extend(_bias_rom_lines(f"l{i}", b, 32, hex_dir=out))
+            L.extend(_bias_rom_lines(f"l{i}", b, acc_bits, hex_dir=out))
         else:
             # Zero bias ROM
             n_out = w.shape[0]
             zero_b = np.zeros(n_out, dtype=np.int64)
-            L.extend(_bias_rom_lines(f"l{i}", zero_b, 32, hex_dir=out))
+            L.extend(_bias_rom_lines(f"l{i}", zero_b, acc_bits, hex_dir=out))
 
     # ---- MAC engine ----
     e(f"    // {'=' * 71}")
     e(f"    // MAC Engine + Requantization")
     e(f"    // {'=' * 71}")
-    e(f"    reg signed [31:0] mac_acc;")
+    e(f"    reg signed [{acc_bits - 1}:0] mac_acc;")
     e()
 
     # Requantization: mux the multiplier based on current layer
@@ -411,12 +505,29 @@ def compile_sequential(
     else:
         e(f"    reg [5:0] req_shift;")
         shift_val = None
-    e(f"    wire signed [63:0] req_ext = {{{{32{{mac_acc[31]}}}}, mac_acc}};")
-    e(f"    wire signed [63:0] req_prod = req_ext * {{{{32{{req_mult[31]}}}}, req_mult}};")
+    # req_mult is 32-bit; the requant product needs acc_bits + 32 bits so the
+    # accumulator value (acc_bits wide) is not truncated when multiplied.
+    req_bits = acc_bits + 32
+    acc_pad = req_bits - acc_bits          # = 32
+    mult_pad = req_bits - 32               # = acc_bits
+    e(f"    wire signed [{req_bits - 1}:0] req_ext = "
+      f"{{{{{acc_pad}{{mac_acc[{acc_bits - 1}]}}}}, mac_acc}};")
+    e(f"    wire signed [{req_bits - 1}:0] req_prod = "
+      f"req_ext * {{{{{mult_pad}{{req_mult[31]}}}}, req_mult}};")
+    # Round-to-nearest (add a half-LSB before the shift) to match
+    # emit.requantize_lines / forward_int, so the sequential output agrees with
+    # the combinational hardware and the golden reference instead of flooring.
     if shift_val is not None:
-        e(f"    wire signed [63:0] req_shifted = req_prod >>> {shift_val};")
+        if shift_val > 0:
+            e(f"    wire signed [{req_bits - 1}:0] req_shifted = "
+              f"(req_prod + {req_bits}'sd{1 << (shift_val - 1)}) >>> {shift_val};")
+        else:
+            e(f"    wire signed [{req_bits - 1}:0] req_shifted = req_prod >>> {shift_val};")
     else:
-        e(f"    wire signed [63:0] req_shifted = req_prod >>> req_shift;")
+        e(f"    wire signed [{req_bits - 1}:0] req_rbias = "
+          f"(req_shift == 0) ? {req_bits}'sd0 : ({req_bits}'sd1 << (req_shift - 1));")
+        e(f"    wire signed [{req_bits - 1}:0] req_shifted = "
+          f"(req_prod + req_rbias) >>> req_shift;")
     e()
     e(f"    // Saturate (linear)")
     e(f"    wire signed [{bits - 1}:0] sat_linear =")
@@ -451,7 +562,7 @@ def compile_sequential(
         e(f"    // Layer {i} ROM readout")
         e(f"    reg [{waddr_bits - 1}:0] l{i}_waddr;")
         e(f"    wire signed [{bits - 1}:0] l{i}_wdata = l{i}_w(l{i}_waddr);")
-        e(f"    wire signed [31:0] l{i}_bdata = l{i}_b(out_neuron[{aw(n_out_l) - 1}:0]);")
+        e(f"    wire signed [{acc_bits - 1}:0] l{i}_bdata = l{i}_b(out_neuron[{aw(n_out_l) - 1}:0]);")
         e()
 
     # ---- Main state machine ----
@@ -463,7 +574,7 @@ def compile_sequential(
     e(f"            state     <= IDLE;")
     e(f"            done      <= 1'b0;")
     e(f"            out_valid <= 1'b0;")
-    e(f"            mac_acc   <= 32'sd0;")
+    e(f"            mac_acc   <= {acc_bits}'sd0;")
     e(f"            in_idx    <= 0;")
     e(f"            out_neuron <= 0;")
     e(f"            io_count  <= 0;")

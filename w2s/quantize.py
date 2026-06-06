@@ -942,6 +942,17 @@ def _quantize_op(
     granularity: QuantGranularity,
 ) -> None:
     """Quantize one operation in-place."""
+    # Structural combiners (Add/Multiply/Concat) carry no weights but DO need
+    # the per-operand and output scales plumbed, so the generator can align
+    # differently-scaled operands instead of adding raw integers in mismatched
+    # scales (see generators/structural.py).
+    if op.op_type in (OpType.ADD, OpType.MULTIPLY, OpType.CONCAT):
+        op.q_params = {
+            'input_scales': [float(tensor_scales.get(n, 1.0)) for n in op.inputs],
+            'output_scale': float(tensor_scales.get(op.outputs[0], 1.0)),
+        }
+        return
+
     if op.op_type not in _WEIGHTED_OPS:
         return
     if not op.weights:

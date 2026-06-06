@@ -637,6 +637,17 @@ def generate_sequential_testbench(
 #  Integer forward pass (for golden vector generation)
 # ---------------------------------------------------------------------------
 
+def _rq(acc, mult, shift):
+    """Requantize acc*mult >> shift with round-to-nearest, matching the
+    hardware (emit.requantize_lines adds a half-LSB before the shift).  acc and
+    mult may be numpy arrays; shift is a scalar int."""
+    prod = acc * (mult.astype(np.int64) if isinstance(mult, np.ndarray) else int(mult))
+    shift = int(shift)
+    if shift > 0:
+        return (prod + (1 << (shift - 1))) >> shift
+    return prod
+
+
 def forward_int(
     graph: ComputeGraph,
     inputs: Dict[str, np.ndarray],
@@ -679,10 +690,7 @@ def _forward_op_int(
         acc = x @ w.T + b
         mult = op.q_params.get('requant_mult', 1)
         shift = op.q_params.get('requant_shift', 0)
-        if isinstance(mult, np.ndarray):
-            scaled = (acc * mult.astype(np.int64)) >> shift
-        else:
-            scaled = (acc * int(mult)) >> shift
+        scaled = _rq(acc, mult, shift)
         act = op.attrs.get('activation', 'none')
         if act == 'relu':
             tensors[op.outputs[0]] = np.clip(scaled, 0, qmax).astype(np.int64)
@@ -790,9 +798,9 @@ def _forward_op_int(
         shift = op.q_params.get('requant_shift', 0)
         if isinstance(mult, np.ndarray):
             for co in range(c_out):
-                out[co] = (out[co] * int(mult[co])) >> shift
+                out[co] = _rq(out[co], int(mult[co]), shift)
         else:
-            out = (out * int(mult)) >> shift
+            out = _rq(out, mult, shift)
 
         act = op.attrs.get('activation', 'none')
         if act == 'relu':
@@ -862,9 +870,9 @@ def _forward_op_int(
         shift = op.q_params.get('requant_shift', 0)
         if isinstance(mult, np.ndarray):
             for co in range(c_out):
-                out[co] = (out[co] * int(mult[co])) >> shift
+                out[co] = _rq(out[co], int(mult[co]), shift)
         else:
-            out = (out * int(mult)) >> shift
+            out = _rq(out, mult, shift)
 
         act = op.attrs.get('activation', 'none')
         if act == 'relu':

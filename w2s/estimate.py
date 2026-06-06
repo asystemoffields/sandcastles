@@ -343,6 +343,23 @@ def _weight_keys_for_op(op: Operation) -> List[str]:
     return []
 
 
+def _sparsity_stats(layer_info: List[Dict]) -> Tuple[float, int]:
+    """Overall weight sparsity and number of pruned (zero) weights.
+
+    Shared by the combinational and sequential paths so both report the same
+    numbers for a given graph.
+    """
+    total_zeros = sum(info.get("n_zero_weights", 0) for info in layer_info)
+    total_weight_elems = sum(
+        sum(w.size for k, w in (info["op"].q_weights or info["op"].weights).items()
+            if k in _weight_keys_for_op(info["op"]))
+        for info in layer_info
+        if _weight_keys_for_op(info["op"])
+    )
+    sparsity = total_zeros / total_weight_elems if total_weight_elems > 0 else 0.0
+    return sparsity, total_zeros
+
+
 # ---------------------------------------------------------------------------
 #  Combinational estimate
 # ---------------------------------------------------------------------------
@@ -437,14 +454,7 @@ def _estimate_combinational(
             "Consider sequential mode for smaller area.")
 
     # Compute sparsity stats
-    total_zeros = sum(info.get("n_zero_weights", 0) for info in layer_info)
-    total_weight_elems = sum(
-        sum(w.size for k, w in (info["op"].q_weights or info["op"].weights).items()
-            if k in _weight_keys_for_op(info["op"]))
-        for info in layer_info
-        if _weight_keys_for_op(info["op"])
-    )
-    overall_sparsity = total_zeros / total_weight_elems if total_weight_elems > 0 else 0.0
+    overall_sparsity, total_zeros = _sparsity_stats(layer_info)
 
     return EstimateReport(
         total_params=total_params,
@@ -557,6 +567,10 @@ def _estimate_sequential(
             f"Design exceeds TT 8x2 max ({estimated_luts:,} LUTs > "
             f"{_TT_MAX_LUTS:,} LUTs). Reduce parameters or bit width.")
 
+    # Sparsity stats: same as the combinational path (a pruned model should
+    # report its sparsity regardless of architecture).
+    overall_sparsity, total_zeros = _sparsity_stats(layer_info)
+
     return EstimateReport(
         total_params=total_params,
         total_multipliers=1,  # sequential: one shared multiplier
@@ -571,6 +585,8 @@ def _estimate_sequential(
         fits_tiny_tapeout=fits,
         tt_tiles_needed=tt_tiles,
         warnings=warnings,
+        sparsity=overall_sparsity,
+        multipliers_eliminated=total_zeros,
         _breakdown={
             "rom_luts": rom_luts,
             "mac_luts": mac_luts,

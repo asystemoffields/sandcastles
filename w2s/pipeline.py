@@ -82,6 +82,8 @@ class StageResult:
     output_files: List[str] = field(default_factory=list)
     message: str = ""
     log: str = ""
+    skipped: bool = False   # True if the stage was requested but did not run
+                            # (e.g. missing tool / missing upstream input)
 
 
 @dataclass
@@ -95,20 +97,30 @@ class PipelineResult:
         lines = ["", "=== Build Pipeline Results ===", ""]
         max_name = max((len(s.name) for s in self.stages), default=10)
         for s in self.stages:
-            status = "PASS" if s.passed else "FAIL"
+            if s.skipped:
+                status = "SKIP"
+            elif s.passed:
+                status = "PASS"
+            else:
+                status = "FAIL"
             lines.append(f"  [{status}] {s.name:<{max_name}}  {s.duration_s:.1f}s  {s.message}")
         lines.append("")
-        if self.success:
+
+        failed = [s for s in self.stages if not s.passed]
+        skipped = [s for s in self.stages if s.skipped]
+        if failed:
+            lines.append(f"  BUILD FAILED at stage: {failed[0].name}")
+            if failed[0].log:
+                lines.append("")
+                lines.append("  Error log:")
+                for line in failed[0].log.split("\n")[:20]:
+                    lines.append(f"    {line}")
+        elif skipped:
+            # Stages were requested but could not run (missing tool / input).
+            names = ", ".join(s.name for s in skipped)
+            lines.append(f"  BUILD INCOMPLETE — stages skipped: {names}")
+        elif self.success:
             lines.append("  BUILD SUCCEEDED")
-        else:
-            failed = [s for s in self.stages if not s.passed]
-            if failed:
-                lines.append(f"  BUILD FAILED at stage: {failed[0].name}")
-                if failed[0].log:
-                    lines.append("")
-                    lines.append("  Error log:")
-                    for line in failed[0].log.split("\n")[:20]:
-                        lines.append(f"    {line}")
         lines.append(f"  Output: {self.output_dir}")
         return "\n".join(lines)
 
@@ -207,6 +219,12 @@ def build(
                 message="SKIPPED (iverilog not found)",
             ))
 
+    # Track whether each downstream stage actually RAN (produced its output),
+    # as opposed to being skipped. A stage must not run if the upstream input
+    # it requires was never produced.
+    synth_ran = False
+    route_ran = False
+
     # Stage 5: Synthesize (optional, requires yosys)
     if synthesize:
         if tools["yosys"].available:
@@ -214,34 +232,55 @@ def build(
             result.stages.append(stage)
             if not stage.passed:
                 return result
+            synth_ran = True  # design.json was produced
         else:
             result.stages.append(StageResult(
                 name="Synthesize",
                 passed=True,
+                skipped=True,
                 duration_s=0,
                 message="SKIPPED (yosys not found)",
             ))
 
-    # Stage 6: Place and route (optional)
+    # Stage 6: Place and route (optional). Requires synthesis output
+    # (design.json); never run it against a missing JSON.
     if route and synthesize:
         pnr_tool = f"nextpnr-{device.family}"
-        if tools.get(pnr_tool, ToolStatus("", None, False)).available:
+        if not synth_ran:
+            result.stages.append(StageResult(
+                name="Place & Route",
+                passed=True,
+                skipped=True,
+                duration_s=0,
+                message="SKIPPED (no synthesis output — synth did not run)",
+            ))
+        elif tools.get(pnr_tool, ToolStatus("", None, False)).available:
             stage = _stage_route(str(out), device, mode, graph.name)
             result.stages.append(stage)
             if not stage.passed:
                 return result
+            route_ran = True
         else:
             result.stages.append(StageResult(
                 name="Place & Route",
                 passed=True,
+                skipped=True,
                 duration_s=0,
                 message=f"SKIPPED ({pnr_tool} not found)",
             ))
 
-    # Stage 7: Bitstream (optional)
+    # Stage 7: Bitstream (optional). Requires place-and-route output.
     if bitstream and route and synthesize:
         pack_tool = "icepack" if device.family == "ice40" else "ecppack"
-        if tools.get(pack_tool, ToolStatus("", None, False)).available:
+        if not route_ran:
+            result.stages.append(StageResult(
+                name="Bitstream",
+                passed=True,
+                skipped=True,
+                duration_s=0,
+                message="SKIPPED (no place-and-route output)",
+            ))
+        elif tools.get(pack_tool, ToolStatus("", None, False)).available:
             stage = _stage_bitstream(str(out), device, mode, graph.name)
             result.stages.append(stage)
             if not stage.passed:
@@ -250,6 +289,7 @@ def build(
             result.stages.append(StageResult(
                 name="Bitstream",
                 passed=True,
+                skipped=True,
                 duration_s=0,
                 message=f"SKIPPED ({pack_tool} not found)",
             ))
@@ -259,7 +299,10 @@ def build(
     generate_build_script(graph, device, str(out), mode)
     generate_constraints(graph, device, str(out), mode)
 
-    result.success = all(s.passed for s in result.stages)
+    # Overall success requires that EVERY requested stage actually ran and
+    # passed. A skipped stage (missing tool / missing upstream input) is NOT
+    # a success — report it as incomplete rather than "BUILD SUCCEEDED".
+    result.success = all(s.passed and not s.skipped for s in result.stages)
     return result
 
 

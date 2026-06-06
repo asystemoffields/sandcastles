@@ -132,17 +132,64 @@ def _sanitize(name: str) -> str:
 
 def _build_attrs_conv(node, inits: Dict[str, np.ndarray]) -> Dict[str, Any]:
     kernel_shape = _onnx_attr(node, "kernel_shape", ())
-    strides = _onnx_attr(node, "strides", (1,) * len(kernel_shape))
-    pads = _onnx_attr(node, "pads", (0,) * (2 * len(kernel_shape)))
+    n_spatial = len(kernel_shape)
+    strides = _onnx_attr(node, "strides", (1,) * n_spatial)
+    dilations = _onnx_attr(node, "dilations", (1,) * n_spatial)
     group = _onnx_attr(node, "group", 1)
-    # pads is [top, left, bottom, right] or [before, after] — collapse to
-    # (pad_h, pad_w) by taking the first half.
-    half = len(pads) // 2
-    padding = tuple(pads[:half])
+    auto_pad = _onnx_attr(node, "auto_pad", "NOTSET")
+    if isinstance(auto_pad, bytes):
+        auto_pad = auto_pad.decode("utf-8")
+
+    # --- Resolve padding ---------------------------------------------------
+    # The generator only emits *symmetric* spatial padding, so any ONNX
+    # construct that would require per-side asymmetric pads must hard-error
+    # instead of silently keeping only the "begin" pads (the old behaviour).
+    if auto_pad and auto_pad != "NOTSET":
+        if auto_pad == "VALID":
+            padding = (0,) * n_spatial
+        elif auto_pad in ("SAME_UPPER", "SAME_LOWER"):
+            pad_each: List[int] = []
+            for k, s, d in zip(kernel_shape, strides, dilations):
+                if s != 1:
+                    raise NotImplementedError(
+                        f"ONNX Conv auto_pad={auto_pad!r} with stride {s} != 1 "
+                        f"produces input-size-dependent asymmetric SAME padding "
+                        f"that the symmetric-only generator cannot express."
+                    )
+                # SAME with stride 1: total pad = effective_kernel - 1.
+                total = d * (k - 1)
+                if total % 2 != 0:
+                    raise NotImplementedError(
+                        f"ONNX Conv auto_pad={auto_pad!r} needs asymmetric "
+                        f"padding (effective kernel {d * (k - 1) + 1} is even) "
+                        f"which the symmetric-only generator cannot express."
+                    )
+                pad_each.append(total // 2)
+            padding = tuple(pad_each)
+        else:
+            raise NotImplementedError(
+                f"Unsupported ONNX Conv auto_pad={auto_pad!r}."
+            )
+    else:
+        pads = _onnx_attr(node, "pads", (0,) * (2 * n_spatial))
+        # ONNX pads = [x1_begin, x2_begin, ..., x1_end, x2_end, ...].
+        half = len(pads) // 2
+        begins = tuple(pads[:half])
+        ends = tuple(pads[half:])
+        if begins != ends:
+            raise NotImplementedError(
+                f"ONNX Conv asymmetric pads (begin={begins}, end={ends}) are "
+                f"not supported: the generator only emits symmetric padding, so "
+                f"keeping only the begins would silently compile a different "
+                f"network."
+            )
+        padding = begins
+
     return {
         "kernel_size": tuple(kernel_shape),
         "stride": tuple(strides),
         "padding": padding,
+        "dilations": tuple(dilations),
         "groups": group,
     }
 
@@ -195,12 +242,25 @@ def _build_attrs_flatten(node) -> Dict[str, Any]:
 
 
 def _build_attrs_embedding(node, inits: Dict[str, np.ndarray]) -> Dict[str, Any]:
-    # Gather used as embedding lookup: input 0 is the weight table.
+    # ONNX Gather only corresponds to an embedding lookup when the data tensor
+    # (input 0) is a 2-D weight table indexed along axis 0.  Any other shape or
+    # axis is a general Gather, which would produce a malformed embedding if we
+    # forced it through — so hard-error instead.
     weight_name = node.input[0] if len(node.input) > 0 else None
-    if weight_name and weight_name in inits:
-        w = inits[weight_name]
-        return {"num_embeddings": w.shape[0], "embedding_dim": w.shape[1]}
-    return {}
+    axis = _onnx_attr(node, "axis", 0)
+    if weight_name is None or weight_name not in inits:
+        raise NotImplementedError(
+            "ONNX Gather with a non-initializer data input cannot be lowered "
+            "to an embedding lookup (it is a general runtime gather)."
+        )
+    w = inits[weight_name]
+    if w.ndim != 2 or axis != 0:
+        raise NotImplementedError(
+            f"ONNX Gather only maps to EMBEDDING when the data tensor is a 2-D "
+            f"initializer and axis == 0 (got ndim={w.ndim}, axis={axis}); a "
+            f"general Gather is not supported by the w2s importer."
+        )
+    return {"num_embeddings": w.shape[0], "embedding_dim": w.shape[1]}
 
 
 def _build_attrs_gemm(node) -> Dict[str, Any]:
@@ -338,16 +398,33 @@ def _extract_weights_conv(node, inits: Dict[str, np.ndarray]) -> Dict[str, np.nd
 
 def _extract_weights_gemm(node, inits: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
     weights: Dict[str, np.ndarray] = {}
-    # Gemm: Y = alpha * A * B + beta * C
-    # Typically input 0 is activation, input 1 is weight, input 2 is bias.
+    # Gemm: Y = alpha * A*B + beta * C.  Input 0 = activation A, input 1 =
+    # weight B, input 2 = bias C.  The dense generator needs weight [out, in].
+    alpha = _onnx_attr(node, "alpha", 1.0)
+    beta = _onnx_attr(node, "beta", 1.0)
+    transA = _onnx_attr(node, "transA", 0)
+    transB = _onnx_attr(node, "transB", 0)
+    if transA:
+        raise NotImplementedError(
+            "ONNX Gemm with transA != 0 is not supported: the activation "
+            "operand A would require a runtime transpose that the dense "
+            "generator cannot express."
+        )
     if len(node.input) >= 2 and node.input[1] in inits:
         w = inits[node.input[1]]
-        transB = _onnx_attr(node, "transB", 0)
-        if transB:
+        # transB=1 => B is stored [out, in] (canonical nn.Linear export) =>
+        # already in the orientation the generator wants, NO transpose.
+        # transB=0 => B is [in, out] => transpose to [out, in].
+        if not transB:
             w = w.T
+        if alpha != 1.0:
+            w = w * alpha
         weights["weight"] = w
     if len(node.input) >= 3 and node.input[2] in inits:
-        weights["bias"] = inits[node.input[2]]
+        bias = inits[node.input[2]]
+        if beta != 1.0:
+            bias = bias * beta
+        weights["bias"] = bias
     return weights
 
 
