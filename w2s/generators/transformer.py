@@ -449,6 +449,7 @@ def generate_gqa(
     head_dim     = op.attrs['head_dim']
     embed_dim    = op.attrs['embed_dim']
     seq_len      = op.attrs['seq_len']
+    causal       = bool(op.attrs.get('causal', False))   # mask j>i for decoders
     heads_per_group = num_heads // num_kv_heads
 
     assert embed_dim == num_heads * head_dim
@@ -635,6 +636,13 @@ def generate_gqa(
             for j in range(seq_len):
                 rw = f"{rpfx}_r{j}"
                 relu_names.append(rw)
+                if causal and j > i:
+                    # Causal mask: future positions contribute nothing.
+                    lines.append(
+                        f"    wire signed [{bits - 1}:0] {rw} = {bits}'sd0;"
+                        f"  // causal mask (j>i)"
+                    )
+                    continue
                 src = score_row[j]
                 lines.append(
                     f"    wire signed [{bits - 1}:0] {rw} = "
@@ -755,8 +763,16 @@ def generate_gqa(
                     lines.append(f"        {sep} {t}")
                 lines[-1] += ";"
 
+                # Rescale by the attn-weight fixed-point scale (2^(bits-1)) before
+                # saturating -- without it the weighted sum overflows and every
+                # context element clamps to +/-max.  (See generate_mha.)
+                ctx_sh = f"{cpfx}_sh"
+                lines.append(
+                    f"    wire signed [{ctx_acc_bits - 1}:0] {ctx_sh} = "
+                    f"{acc_w} >>> {frac_shift};"
+                )
                 sat_w = f"{cpfx}_sat"
-                lines += emit.saturate(acc_w, ctx_acc_bits, sat_w, bits)
+                lines += emit.saturate(ctx_sh, ctx_acc_bits, sat_w, bits)
                 pos_ctx.append(sat_w)
                 lines.append("")
 

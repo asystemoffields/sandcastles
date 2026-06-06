@@ -1054,18 +1054,25 @@ def _compute_mac_requant(
     # Compute requantization multiplier(s)
     if granularity == QuantGranularity.PER_CHANNEL and weight.ndim >= 2:
         n_out = weight.shape[0]
+        # All channels share ONE shift S: the hardware applies a single >>S to
+        # the whole accumulator vector.  compute_requant lowers the shift for a
+        # channel whose multiplier would overflow int32, so the common shift
+        # must be the MIN of the per-channel safe shifts (the largest-ratio
+        # channel binds).  The old code used max() and then kept each channel's
+        # multiplier from a *different* (smaller) shift than the one actually
+        # applied, silently mis-scaling high-ratio channels by up to 2^delta.
+        safe_shifts = np.zeros(n_out, dtype=np.int64)
+        for c in range(n_out):
+            _, s = compute_requant(input_scale, w_scales[c], output_scale, 16)
+            safe_shifts[c] = s
+        shift = int(np.min(safe_shifts))
         requant_mults = np.zeros(n_out, dtype=np.int64)
-        # Two-pass approach: first find the maximum shift needed across
-        # all channels, then recompute all multipliers with that shift.
-        shifts = np.zeros(n_out, dtype=np.int64)
         for c in range(n_out):
-            m, s = compute_requant(input_scale, w_scales[c], output_scale, 16)
-            requant_mults[c] = m
-            shifts[c] = s
-        shift = int(np.max(shifts))
-        for c in range(n_out):
-            m, s = compute_requant(input_scale, w_scales[c], output_scale, shift)
-            requant_mults[c] = m
+            acc_scale = input_scale * float(w_scales[c])
+            if acc_scale < 1e-30:
+                acc_scale = 1e-30
+            M = int(round((output_scale / acc_scale) * (1 << shift)))
+            requant_mults[c] = max(-0x7FFFFFFF, min(0x7FFFFFFF, M))
         op.q_params = {
             'requant_mult': requant_mults,
             'requant_shift': shift,
@@ -1114,21 +1121,28 @@ def _compute_mha_requant(
     )
     a_bits = acc_bits_for(embed_dim, bits)
 
-    # Quantize all weight matrices
-    proj_names = [
-        'q_weight', 'k_weight', 'v_weight', 'out_weight',
-        'q_bias', 'k_bias', 'v_bias', 'out_bias',
-    ]
+    # Quantize each projection weight PER-TENSOR (one scalar scale), matching
+    # the single scalar requant the generator applies per projection...
     w_scale_map = {}
-    for pname in proj_names:
-        if pname in op.weights:
-            warr = op.weights[pname]
-            q_arr, ws = quantize_tensor(warr, bits, scheme, granularity, axis=0)
-            op.q_weights[pname] = q_arr
-            w_scale_map[pname] = float(ws[0]) if ws.size == 1 else ws
+    for wkey in ('q_weight', 'k_weight', 'v_weight', 'out_weight'):
+        if wkey in op.weights:
+            q_arr, ws = quantize_tensor(
+                op.weights[wkey], bits, scheme,
+                QuantGranularity.PER_TENSOR, axis=0)
+            op.q_weights[wkey] = q_arr
+            w_scale_map[wkey] = float(np.asarray(ws).reshape(-1)[0])
 
-    # Per-projection requantization: each projection (q, k, v, out) gets
-    # its own requant_mult/shift, computed from its weight scale.
+    # ...then quantize each bias in its projection's ACCUMULATOR scale
+    # (input_scale * weight_scale) so it adds correctly to the MAC accumulator.
+    # The old code quantized biases at their own abs-max scale, putting them in
+    # an unrelated magnitude (often ~10x off) and corrupting every projection.
+    for proj in ('q', 'k', 'v', 'out'):
+        bkey = f'{proj}_bias'
+        if bkey in op.weights:
+            ws = w_scale_map.get(f'{proj}_weight', 1.0)
+            bias = np.asarray(op.weights[bkey], dtype=np.float64)
+            op.q_weights[bkey] = np.round(bias * input_scale * ws).astype(np.int64)
+
     op.q_params = {
         'input_scale': float(input_scale),
         'weight_scale': w_scale_map,
@@ -1137,10 +1151,7 @@ def _compute_mha_requant(
     }
 
     for proj in ('q', 'k', 'v', 'out'):
-        wkey = f'{proj}_weight'
-        ws = w_scale_map.get(wkey, 1.0)
-        if isinstance(ws, np.ndarray):
-            ws = float(ws[0])
+        ws = w_scale_map.get(f'{proj}_weight', 1.0)
         m, s = compute_requant(input_scale, float(ws), output_scale)
         op.q_params[f'{proj}_requant_mult'] = m
         op.q_params[f'{proj}_requant_shift'] = s
@@ -1267,18 +1278,26 @@ def _compute_swiglu_requant(
     input_scale = tensor_scales.get(input_name, 1.0)
     output_scale = tensor_scales.get(output_name, 1.0)
 
-    # Quantize all weight tensors
-    weight_names = [
-        'gate_weight', 'up_weight', 'down_weight',
-        'gate_bias', 'up_bias', 'down_bias',
-    ]
+    # Quantize each projection weight PER-TENSOR (scalar scale), matching the
+    # scalar requant applied per projection...
     w_scale_map = {}
-    for wname in weight_names:
-        if wname in op.weights:
-            warr = op.weights[wname]
-            q_arr, ws = quantize_tensor(warr, bits, scheme, granularity, axis=0)
-            op.q_weights[wname] = q_arr
-            w_scale_map[wname] = float(ws[0]) if ws.size == 1 else ws
+    for wkey in ('gate_weight', 'up_weight', 'down_weight'):
+        if wkey in op.weights:
+            q_arr, ws = quantize_tensor(
+                op.weights[wkey], bits, scheme,
+                QuantGranularity.PER_TENSOR, axis=0)
+            op.q_weights[wkey] = q_arr
+            w_scale_map[wkey] = float(np.asarray(ws).reshape(-1)[0])
+
+    # ...then quantize each bias in the accumulator scale (input_scale *
+    # weight_scale) that the projection's requant assumes -- NOT the bias's own
+    # abs-max scale (the old, wrong behaviour).
+    for proj in ('gate', 'up', 'down'):
+        bkey = f'{proj}_bias'
+        if bkey in op.weights:
+            ws = w_scale_map.get(f'{proj}_weight', 1.0)
+            bias = np.asarray(op.weights[bkey], dtype=np.float64)
+            op.q_weights[bkey] = np.round(bias * input_scale * ws).astype(np.int64)
 
     # Accumulator bits — use the largest weight dimension
     gate_w = op.weights['gate_weight']         # (ffn_dim, dim)
@@ -1331,18 +1350,23 @@ def _compute_gqa_requant(
     )
     a_bits = acc_bits_for(embed_dim, bits)
 
-    # Quantize all weight matrices
-    proj_names = [
-        'q_weight', 'k_weight', 'v_weight', 'out_weight',
-        'q_bias', 'k_bias', 'v_bias', 'out_bias',
-    ]
+    # Quantize each projection weight PER-TENSOR (scalar scale), then quantize
+    # each bias in its accumulator scale (input_scale * weight_scale) -- not the
+    # bias's own abs-max scale (the old, wrong behaviour).
     w_scale_map = {}
-    for pname in proj_names:
-        if pname in op.weights:
-            warr = op.weights[pname]
-            q_arr, ws = quantize_tensor(warr, bits, scheme, granularity, axis=0)
-            op.q_weights[pname] = q_arr
-            w_scale_map[pname] = float(ws[0]) if ws.size == 1 else ws
+    for wkey in ('q_weight', 'k_weight', 'v_weight', 'out_weight'):
+        if wkey in op.weights:
+            q_arr, ws = quantize_tensor(
+                op.weights[wkey], bits, scheme,
+                QuantGranularity.PER_TENSOR, axis=0)
+            op.q_weights[wkey] = q_arr
+            w_scale_map[wkey] = float(np.asarray(ws).reshape(-1)[0])
+    for proj in ('q', 'k', 'v', 'out'):
+        bkey = f'{proj}_bias'
+        if bkey in op.weights:
+            ws = w_scale_map.get(f'{proj}_weight', 1.0)
+            bias = np.asarray(op.weights[bkey], dtype=np.float64)
+            op.q_weights[bkey] = np.round(bias * input_scale * ws).astype(np.int64)
 
     op.q_params = {
         'input_scale': float(input_scale),

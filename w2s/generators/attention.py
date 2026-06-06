@@ -48,6 +48,10 @@ def generate_mha(
     head_dim = op.attrs['head_dim']
     embed_dim = op.attrs['embed_dim']
     seq_len = op.attrs['seq_len']
+    # Causal (autoregressive) attention: position i may only attend to j <= i.
+    # Decoder/LM importers must set attrs['causal']=True; otherwise the model
+    # would attend to future tokens.  Defaults to False (bidirectional).
+    causal = bool(op.attrs.get('causal', False))
     assert embed_dim == num_heads * head_dim
 
     # -- Quantised weights / params --
@@ -239,6 +243,14 @@ def generate_mha(
             for j in range(seq_len):
                 rw = f"{rpfx}_r{j}"
                 relu_names.append(rw)
+                if causal and j > i:
+                    # Causal mask: future positions contribute nothing (and are
+                    # excluded from the normalising sum).
+                    lines.append(
+                        f"    wire signed [{bits - 1}:0] {rw} = {bits}'sd0;"
+                        f"  // causal mask (j>i)"
+                    )
+                    continue
                 src = score_wires[h][i][j]
                 lines.append(
                     f"    wire signed [{bits - 1}:0] {rw} = "
@@ -383,10 +395,18 @@ def generate_mha(
                     lines.append(f"        {sep} {t}")
                 lines[-1] += ";"
 
-                # Saturate back to bits (no requant -- attn weights already
-                # encode the scale via the fixed-point normalisation)
+                # Rescale before saturating: the normalised attn weights sum to
+                # 2^(bits-1) ("1.0" in Q(bits-1)), so the weighted sum Sum_j
+                # attn*V is 2^(bits-1) too large.  Shifting it back down is
+                # mandatory -- without it every context element overflows int{bits}
+                # and saturates to +/-max regardless of the actual values.
+                ctx_sh = f"{cpfx}_sh"
+                lines.append(
+                    f"    wire signed [{ctx_acc_bits - 1}:0] {ctx_sh} = "
+                    f"{acc_w} >>> {frac_shift};  // / 2^(bits-1) attn-weight scale"
+                )
                 sat_w = f"{cpfx}_sat"
-                lines += emit.saturate(acc_w, ctx_acc_bits, sat_w, bits)
+                lines += emit.saturate(ctx_sh, ctx_acc_bits, sat_w, bits)
                 pos_ctx.append(sat_w)
                 lines.append("")
             head_ctx.append(pos_ctx)
